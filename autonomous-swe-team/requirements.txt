@@ -1,0 +1,3 @@
+# Dependencias del proyecto autonomous-swe-team.
+# Vacío por ahora: se llenara segun las librerias que se usen al implementar
+# (langgraph, langchain, proveedor de LLM, chromadb/faiss, langfuse, mcp, pytest, etc.).
