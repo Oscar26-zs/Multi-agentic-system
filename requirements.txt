@@ -8,7 +8,8 @@ langgraph
 langchain-openai          # cliente OpenAI-compatible: lo usamos apuntando a OpenRouter
 langchain-anthropic       # fallback pagado opcional (hoy no se usa, queda instalado)
 langchain-community
-chromadb                  # vector store embebido (embeddings default locales MiniLM)
+chromadb                  # vector store embebido; embedding ONNX MiniLM-L6-v2 incluido (sin torch)
+langchain-chroma          # wrapper moderno de Chroma para LangChain
 langfuse
 python-dotenv
 pydantic
