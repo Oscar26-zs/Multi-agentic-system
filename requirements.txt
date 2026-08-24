@@ -1,3 +1,17 @@
-# Dependencias del proyecto autonomous-swe-team.
-# Vacío por ahora: se llenara segun las librerias que se usen al implementar
-# (langgraph, langchain, proveedor de LLM, chromadb/faiss, langfuse, mcp, pytest, etc.).
+# ============================================================
+# autonomous-swe-team — dependencias del proyecto completo
+# Se instalan todas de una vez (Fase 0 de Guia_Construccion.md)
+# ============================================================
+
+langchain
+langgraph
+langchain-openai          # cliente OpenAI-compatible: lo usamos apuntando a OpenRouter
+langchain-anthropic       # fallback pagado opcional (hoy no se usa, queda instalado)
+langchain-community
+chromadb                  # vector store embebido (embeddings default locales MiniLM)
+langfuse
+python-dotenv
+pydantic
+pytest
+mcp                       # SDK oficial Model Context Protocol
+tiktoken
