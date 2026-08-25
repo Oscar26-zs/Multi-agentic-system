@@ -271,6 +271,132 @@ Al correrse directamente (`python agents/security_agent.py`), el agente se prueb
 
 ---
 
+## 4. Developer Agent (`agents/developer_agent.py`)
+
+La propuesta del Architect Agent (`architecture`) llega ahora a la mesa del **ingeniero que construye de verdad**. A diferencia de los tres agentes anteriores, este no solo lee y redacta un documento estructurado: **actúa** sobre el repositorio real del sistema MVC (`REPO_TARGET_PATH`), explorando su estructura y creando/editando archivos a través de las tools MCP (`mcp_server/server.py`, Fase 5). Es el único agente autorizado a tocar el filesystem, y siempre lo hace a través de esas tools sandboxeadas — nunca abre un archivo directamente.
+
+Es el **agente 4 de 6** en el orden de construcción de la Fase 6. Introduce dos cosas nuevas: (1) el retriever de desarrollo (`get_development_retriever`, dominio `knowledge/development/`) y (2) el primer uso real del **MCP** — un servidor externo con el que este agente conversa por protocolo, no por import directo.
+
+Un detalle importante de **orden de ejecución**, no solo de orden de construcción: el pipeline real del grafo (ver `README.md`) es `Product → Architect → Developer → Security → Testing → Reviewer` — el Developer Agent corre **antes** que el Security Agent. Por eso este agente lee `architecture` (obligatoria) y `specification` (opcional, como contexto de negocio), pero **no** depende de `security_review`: en el punto del flujo donde corre, ese campo todavía no existe. (Esto también explica retroactivamente por qué `security_agent.py`, agente 3/6, se construyó y probó solo contra una `architecture` de prueba: el orden de construcción de la Fase 6 optimiza para introducir una dependencia nueva a la vez al probar cada agente aislado, y no necesariamente coincide con el orden de ejecución final del grafo.)
+
+### Qué hace, paso a paso
+
+**1. Recibe la arquitectura (y la especificación, como contexto de negocio)**
+
+```python
+architecture = state["architecture"]
+specification = state.get("specification", {})
+```
+
+Igual que los agentes anteriores: si `architecture` está vacío, se niega a trabajar (`raise ValueError`).
+
+**2. Va a la biblioteca de desarrollo antes de escribir código (RAG)**
+
+Mismo mecanismo que Architect y Security, pero contra `knowledge/development/` (`coding-standards.md`, `clean-code-guidelines.md`), con la consulta armada desde el resumen, los componentes y el `plan_alto_nivel` de la arquitectura.
+
+**3. Se conecta al servidor MCP por protocolo real, no por import**
+
+```python
+async with stdio_client(_mcp_server_params()) as (read, write):
+    async with ClientSession(read, write) as session:
+        await session.initialize()
+        tools_result = await session.list_tools()
+```
+
+`_mcp_server_params()` lanza `python -m mcp_server.server` como subproceso stdio — exactamente el mismo camino que ejercita `tests/test_mcp_protocol.py`. El agente nunca importa `mcp_server/server.py` directamente: conversa con él como lo haría cualquier cliente MCP externo, lo que también significa que el sandboxing de rutas (`_safe_resolve`) queda enteramente del lado del servidor, fuera del alcance de este archivo.
+
+**4. Bindea las tools MCP al LLM sin depender de un adapter externo**
+
+```python
+tool_schemas = [_tool_to_schema(t) for t in tools_result.tools]
+llm_with_tools = build_llm().bind_tools(tool_schemas)
+```
+
+`requirements.txt` no incluye `langchain-mcp-adapters`. No hace falta: una `mcp.types.Tool` ya trae `name`, `description` e `input_schema` (JSON Schema), que es exactamente la forma `{"type": "function", "function": {"name", "description", "parameters"}}` que `bind_tools()` espera de un LLM compatible con OpenAI tools. `_tool_to_schema()` es solo ese remapeo de nombres de campo.
+
+**5. Corre un ciclo ReAct manual, con presupuesto limitado**
+
+```python
+for _ in range(MAX_TOOL_ITERATIONS):
+    ai_message = llm_with_tools.invoke(messages)
+    messages.append(ai_message)
+    if not ai_message.tool_calls:
+        break
+    for tool_call in ai_message.tool_calls:
+        result = await session.call_tool(tool_call["name"], tool_call.get("args", {}))
+        ...
+```
+
+Cada vuelta: el LLM decide si pide una tool o si ya terminó. Si pide una, el agente la ejecuta de verdad contra el servidor MCP real (no una simulación) y le devuelve el resultado como `ToolMessage` — incluido el mensaje de error tal cual, si la tool falla (ej. "ya existe", "escapa del repositorio"), para que el LLM tenga la chance de corregirse en la siguiente vuelta. `MAX_TOOL_ITERATIONS = 12` evita un loop infinito con un modelo gratuito que no sepa cuándo parar; si se agota, el agente no falla — sigue al resumen final con lo que se alcanzó a hacer, dejando una nota explícita (`⚠ se alcanzó MAX_TOOL_ITERATIONS...`) en vez de fallar en silencio. Esto se verificó en la práctica durante el smoke test: en una corrida con un `_mcp_scratch/` que ya tenía un archivo de una prueba anterior, el modelo repitió el mismo `create_file` fallido varias veces sin recuperarse solo — el límite cortó el loop igual, y el reporte final reflejó fielmente "0 archivos creados", sin inventar un resultado que no ocurrió.
+
+**6. No le pregunta al LLM qué archivos tocó — lo cuenta él mismo**
+
+```python
+def _track_change(tool_call, result_text, is_error, diffs, archivos_creados, archivos_modificados):
+    if is_error:
+        return
+    if tool_call["name"] == "create_file":
+        ...
+    elif tool_call["name"] == "update_file":
+        ...
+```
+
+Esta es la decisión más importante del agente, y lleva un paso más allá el principio de "no confiar en que el LLM recuerde bien" que ya usaban `fuentes_consultadas` (Architect) y `aprobado` (Security): ahí el patrón era pedirle un valor al LLM y **corregirlo** después con un dato verificable. Acá directamente **no se le pide** al LLM que enumere qué archivos creó o modificó — después de varias vueltas de tool-calling, un modelo gratuito tiende a recordar mal una ruta exacta o el contenido preciso de lo que escribió. En cambio, `_track_change()` intercepta cada `create_file`/`update_file` que el LLM REALMENTE ejecutó (con éxito) contra el servidor y arma `archivos_creados`, `archivos_modificados` y un diff real (`difflib.unified_diff`, sobre el fragmento en `update_file` o el archivo completo en `create_file`) a partir de los argumentos y el resultado reales de esa llamada — no de lo que el LLM cree haber hecho.
+
+No existe todavía una tool `get_diff` en `mcp_server/server.py` (su docstring dice explícitamente "run_tests y get_diff se agregarán después"), así que el diff se calcula en el propio agente con `difflib`, sobre el texto que el propio agente le pasó a `update_file`/`create_file` como argumento — no requiere una lectura adicional del archivo.
+
+**7. Solo le pide criterio al LLM para la parte que sí lo requiere**
+
+```python
+structured_llm = build_llm().with_structured_output(ImplementationSummary, method="function_calling")
+summary = structured_llm.invoke(messages + [HumanMessage(content=_SUMMARY_PROMPT)])
+```
+
+`ImplementationSummary` (structured output, en una llamada aparte DESPUÉS de cerrar el ciclo de tools) solo tiene dos campos: `resumen` y `notas` (desviaciones del plan, limitaciones, seguimientos sugeridos). Es la única parte del reporte que es opinión, no un hecho verificable — todo lo demás (`archivos_creados`, `archivos_modificados`, `diff`, `pasos_seguidos`) ya se calculó en el paso anterior y se copia tal cual al dict final.
+
+**8. Entrega solo su parte del expediente**
+
+```python
+implementation = {
+    "resumen": summary.resumen,
+    "notas": summary.notas,
+    "archivos_creados": archivos_creados,
+    "archivos_modificados": archivos_modificados,
+    "diff": _format_diffs(diffs),
+    "pasos_seguidos": pasos,
+    "fuentes_consultadas": fuentes,
+}
+return {"implementation": implementation, "messages": [...]}
+```
+
+Mismo patrón de update parcial que los tres agentes anteriores.
+
+### Por qué está construido así (decisiones clave)
+
+- **Conexión MCP por protocolo (`stdio_client` + `ClientSession`), no por import directo de `mcp_server/server.py`.** Ejercita el mismo camino que un cliente MCP externo real (igual que `tests/test_mcp_protocol.py`), y mantiene el sandboxing de rutas completamente del lado del servidor.
+- **Sin `langchain-mcp-adapters`.** El schema de una `mcp.types.Tool` ya calza con el formato que `bind_tools()` espera; agregar una dependencia extra para ese remapeo habría sido infraestructura innecesaria.
+- **`archivos_creados`/`archivos_modificados`/`diff`/`pasos_seguidos` se calculan en Python, nunca se le piden al LLM.** Ver el punto 6 arriba — es la aplicación más estricta hasta ahora del principio "no confiar en la memoria del modelo para hechos verificables", validado en la práctica durante el smoke test de este mismo agente.
+- **`MAX_TOOL_ITERATIONS = 12` como salvavidas, no como fallo.** Si se agota, el agente igual entrega un reporte coherente con lo que realmente pasó (aunque sea parcial), en vez de lanzar una excepción y tirar todo el progreso del ciclo.
+- **Sin dependencia de `security_review`.** Ver la nota de orden de ejecución más arriba: en el grafo real, Developer corre antes que Security, así que ese campo del estado todavía no existe cuando este agente se ejecuta.
+- **`temperature=0` y `method="function_calling"`** para la llamada de resumen final: mismas razones que los agentes anteriores.
+- **`@observe(name="developer_agent")`**: traza la corrida completa en Langfuse, incluyendo (vía los LLM calls internos) tanto las decisiones de tool-calling del ciclo ReAct como la llamada de resumen final.
+
+### Cómo se prueba (el bloque `if __name__ == "__main__":`)
+
+Al correrse directamente (`python agents/developer_agent.py`), el agente se prueba **solo**, sin pasar por el grafo — pero a diferencia de los tres agentes anteriores, esta prueba SÍ toca un repositorio real (`REPO_TARGET_PATH`), aunque sea con una `architecture` de prueba deliberadamente inofensiva (crear una nota de documentación en `_mcp_scratch/`, nunca código de producción):
+
+1. Verifica `OPENROUTER_API_KEY` y que `REPO_TARGET_PATH` exista (si no, corta con un mensaje claro pidiendo clonar el repo MVC ahí — no intenta arrancar el servidor MCP contra una ruta inexistente).
+2. Arma un estado con `specification` + `architecture` de prueba escritas a mano.
+3. Confirma que el retriever de desarrollo devuelve al menos un fragmento.
+4. Invoca `developer_agent` de verdad (LLM real + servidor MCP real vía subproceso stdio), dentro de un `try/finally`.
+5. Imprime el JSON resultante y valida que `archivos_creados` y `pasos_seguidos` no hayan quedado vacíos.
+6. **Siempre**, incluso si el paso anterior lanza una excepción al imprimir, limpia `_mcp_scratch/` en el `finally` — necesario porque un `_mcp_scratch/` con un archivo de una corrida previa hace que el siguiente `create_file` falle con "ya existe", confundiendo innecesariamente al LLM en la próxima corrida (bug real encontrado y corregido durante la construcción de este agente: el primer smoke test dejó basura porque el `print()` final crasheó por un carácter Unicode fuera de `cp1252` en la consola de Windows, y el cleanup —que corría después del print— nunca se ejecutó).
+7. Fuerza el flush de traces a Langfuse antes de terminar.
+
+**Nota de entorno (Windows):** si al correr este smoke test ves `UnicodeEncodeError: 'charmap' codec...` al imprimir el JSON, es la consola de Windows (cp1252), no un bug del agente — corre con `PYTHONIOENCODING=utf-8` por delante (`PYTHONIOENCODING=utf-8 python agents/developer_agent.py`).
+
+---
+
 ## Qué sigue
 
-El siguiente agente (`developer_agent.py`, agente 4/6) va a **leer** la `architecture` (y el `security_review`, para no reintroducir lo que el Security Agent ya marcó como hallazgo) y va a ser el primero en usar el servidor MCP (`mcp_server/server.py`, Fase 5) para leer y modificar código real del repo objetivo — la primera dependencia nueva del pipeline que no es RAG. Se documenta acá mismo, como una sección nueva, cuando se construya.
+El siguiente agente (`testing_agent.py`, agente 5/6) va a **leer** la `implementation` que dejó el Developer Agent y va a usar la tool MCP `run_tests` (que hay que agregar a `mcp_server/server.py`, ya que hoy solo existen `list_files`/`read_file`/`search_code`/`create_file`/`update_file`) para correr las pruebas reales del repo objetivo y reportar pass/fail. Se documenta acá mismo, como una sección nueva, cuando se construya.
