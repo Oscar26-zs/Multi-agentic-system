@@ -492,6 +492,82 @@ Igual que `developer_agent.py`: preflight de `OPENROUTER_API_KEY` y `REPO_TARGET
 
 ---
 
-## Qué sigue
+## 6. Reviewer Agent (`agents/reviewer_agent.py`)
 
-El siguiente agente (`reviewer_agent.py`, agente 6/6) va a **leer** todo el estado acumulado (`specification`, `architecture`, `implementation`, `security_review`, `test_results`) y va a emitir el veredicto final: `APPROVED` o `REJECTED` con `return_to`, sin depender de RAG ni de MCP — es el único agente que solo lee el resto del estado. Se documenta acá mismo, como una sección nueva, cuando se construya.
+Todo el expediente llega ahora a la última mesa: la del **tech lead del estudio**, el socio que firma el trabajo antes de dárselo por terminado. No consulta ninguna biblioteca nueva (no hay RAG) ni toca el repositorio (no hay MCP) — su materia prima es el expediente completo que ya armaron los cinco agentes anteriores: la especificación, el plano de arquitectura, lo que construyó el desarrollador, el informe de seguridad y los resultados de las pruebas. Su trabajo es leerlo todo de punta a punta y decidir: ¿esto se entrega (`APPROVED`), o hay que devolverlo a alguien puntual del equipo para que lo corrija (`REJECTED`, con `return_to`)?
+
+Es el **agente 6 de 6**, y el único que no introduce ninguna dependencia nueva — es pura evaluación sobre el estado ya acumulado. Con este agente se completa la Fase 6 de la guía: los seis agentes existen y están probados de forma aislada.
+
+### Qué hace, paso a paso
+
+**1. Recibe el expediente completo**
+
+```python
+specification = state.get("specification", {})
+architecture = state.get("architecture", {})
+implementation = state.get("implementation", {})
+security_review = state.get("security_review", {})
+test_results = state.get("test_results", {})
+```
+
+Todos se leen con `state.get(...)`, salvo `implementation`, que es la única que se exige (`raise ValueError` si está vacía): sin al menos lo que construyó el Developer Agent, no hay nada concreto que un tech lead pueda firmar. `security_review` y `test_results` vacíos son válidos para poder probar este agente de forma aislada (Fase 6) sin tener que simular el pipeline completo — aunque en el grafo real, para cuando el Reviewer corre, ya existen los cinco.
+
+**2. Le pide al LLM un veredicto con motivos y feedback accionable**
+
+`_SYSTEM_PROMPT` le da al LLM el rol de tech lead: evaluar el expediente completo (no un solo aspecto), ser exigente pero justo, y — el punto más importante — dirigir el `feedback` específicamente al agente que tiene que corregirlo, no "al equipo" en general. `ReviewVerdict` es el formulario:
+
+| Campo | Qué captura | Analogía |
+|---|---|---|
+| `status` | `APPROVED` o `REJECTED` | El sello de aprobado/rechazado en la carpeta |
+| `resumen` | Evaluación breve del expediente completo | La nota de tapa del informe |
+| `motivos` | Razones concretas detrás del veredicto | Los puntos que el tech lead marcó en la revisión |
+| `feedback` | Accionable, dirigido al agente destino | La nota post-it pegada en la página exacta que hay que corregir |
+| `return_to` | A qué agente vuelve el trabajo si `REJECTED` | A qué escritorio del estudio vuelve la carpeta |
+
+**3. No confía en que el LLM respete lo que otros agentes ya verificaron de forma objetiva**
+
+```python
+security_bloquea = security_review.get("aprobado") is False
+testing_bloquea = test_results.get("aprobado") is False
+
+if security_bloquea or testing_bloquea:
+    data["status"] = "REJECTED"
+    ...
+```
+
+Esta es la decisión más importante del agente, y la aplicación más crítica hasta ahora del principio que ya venía de agentes anteriores ("no confiar en la memoria del modelo para hechos verificables"): `security_review["aprobado"]` y `test_results["aprobado"]` NO fueron calculados por el LLM del Reviewer — ya los calculó Python de forma determinista en `security_agent.py` y `testing_agent.py`, contando hallazgos bloqueantes y tests en rojo reales. Si cualquiera de los dos es `False`, `_coerce_verdict()` fuerza `REJECTED` con un `return_to` fijo (`architect_agent` para seguridad, `developer_agent` para testing) **sin importar qué haya decidido el LLM** — incluso si el LLM, por ser "amable" o no darle suficiente peso a un hallazgo, hubiera dicho `APPROVED`. Es el mismo principio que corregía `fuentes_consultadas` o contaba `archivos_creados`, llevado a la decisión de mayor riesgo de todo el pipeline: el Reviewer es el último filtro, y es el peor lugar posible para que un modelo gratuito se equivoque por exceso de indulgencia.
+
+El guardrail de seguridad manda específicamente a `architect_agent` y no a `security_agent`: tal como está construido `security_agent.py` (agente 3/6), audita la ARQUITECTURA propuesta, no código — si hay un hallazgo bloqueante, lo que hay que corregir es el diseño.
+
+Fuera de esos dos guardrails (todo aprobado, o el LLM ya dijo `REJECTED` por su cuenta con un `return_to` válido), el veredicto del LLM se respeta tal cual — el Reviewer no le saca autoridad al modelo, solo le pone un piso que no puede cruzar.
+
+**4. Entrega su parte del expediente — y no toca el contador del ciclo**
+
+```python
+return {"review": review, "messages": [...]}
+```
+
+A diferencia de todos los agentes anteriores, `reviewer_agent()` NO incrementa `state["iteration"]`. Ese contador (y la comparación contra `MAX_ITERATIONS`) es responsabilidad de la conditional edge en `graph/edges.py`, que todavía no existe (Fase 7) — el comentario de `graph/state.py` ya lo dejaba explícito: "lo compara MAX_ITERATIONS en workflow.py". El Reviewer solo dice qué pasó; decidir si el ciclo sigue o se corta es trabajo del grafo, no del agente.
+
+### Por qué está construido así (decisiones clave)
+
+- **Sin RAG, sin MCP.** Es deliberado: no hay una guía externa que consultar en esta etapa ni código que tocar — el material de revisión es el estado que ya dejaron los cinco agentes anteriores.
+- **Los guardrails deterministas se validaron directamente, sin gastar LLM.** `_coerce_verdict()` se probó con un `ReviewVerdict` sintético que dice `APPROVED` a propósito, confirmando que igual se fuerza `REJECTED`/`architect_agent` cuando `security_review["aprobado"]` es `False`, y `REJECTED`/`developer_agent` cuando `test_results["aprobado"]` es `False` — la parte más crítica del agente no depende de que el LLM esté disponible para poder verificarse.
+- **`return_to` limitado a un `Literal` de 5 valores exactos** (los cinco agentes anteriores), no texto libre: así el grafo (Fase 7) puede enrutar la conditional edge con un `match`/diccionario simple, sin tener que interpretar lenguaje natural.
+- **`temperature=0` y `method="function_calling"`**: mismas razones que los cinco agentes anteriores.
+- **`@observe(name="reviewer_agent")`**: traza la corrida en Langfuse, incluyendo el expediente completo que se le pasó al modelo como contexto — útil para auditar, caso por caso, si un `APPROVED`/`REJECTED` fue razonable dado lo que el modelo tenía delante.
+
+### Cómo se prueba (el bloque `if __name__ == "__main__":`)
+
+Al correrse directamente (`python agents/reviewer_agent.py`), corre DOS escenarios sobre el mismo expediente de prueba (specification + architecture + implementation escritas a mano, simulando a los tres primeros agentes):
+
+1. **Escenario A** — `security_review["aprobado"]=True` y `test_results["aprobado"]=True`: el veredicto queda a criterio del LLM.
+2. **Escenario B** — se fuerza `security_review["aprobado"]=False` con un hallazgo simulado: el script hace `assert` de que el resultado sea `REJECTED` con `return_to == "architect_agent"`, sin importar qué haya dicho el LLM — verificación explícita de que el guardrail determinista manda.
+
+**Validación durante la construcción:** el ciclo LLM completo (escenarios A y B) quedó bloqueado por el límite diario gratuito de OpenRouter (`Rate limit exceeded: free-models-per-day`, mismo límite que ya había topado `testing_agent.py`, resetea a las 00:00 UTC). En su lugar, `_coerce_verdict()` se validó de forma aislada con cuatro casos sintéticos (sin gastar cuota de LLM): guardrail de seguridad fuerza `REJECTED`/`architect_agent` aunque el LLM diga `APPROVED`; guardrail de testing fuerza `REJECTED`/`developer_agent` aunque el LLM diga `APPROVED`; sin bloqueos se respeta el veredicto del LLM; y un `REJECTED` sin `return_to` válido cae a `developer_agent` por defecto. Los cuatro pasaron. Queda pendiente repetir el smoke test completo (con LLM real) cuando se libere el límite diario o se agreguen créditos a la cuenta de OpenRouter.
+
+---
+
+## Los 6 agentes, completos
+
+Con `reviewer_agent.py` se cierra la Fase 6 de `Guia_Construccion.md`: los seis agentes (`product_agent`, `architect_agent`, `security_agent`, `developer_agent`, `testing_agent`, `reviewer_agent`) existen y fueron probados de forma aislada, cada uno agregando una sola dependencia nueva a la vez (LLM solo → RAG → RAG de otro dominio → MCP → MCP + nueva tool → nada nuevo, solo evaluación). El siguiente paso es la Fase 7: `graph/nodes.py` (envolver cada función de agente como nodo de LangGraph), `graph/workflow.py` (el camino feliz, sin ciclos: Product → Architect → Developer → Security → Testing → Reviewer → END) y, recién cuando eso funcione, `graph/edges.py` (la conditional edge que usa `review["return_to"]` para volver atrás cuando el veredicto es `REJECTED`, con el límite `MAX_ITERATIONS`).
