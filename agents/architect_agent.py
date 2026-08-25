@@ -25,10 +25,10 @@ Decisiones (Fase 6 de Guia_Construccion.md, agente 2/6):
       los `source` reales devueltos por el retriever (no se confía en que el
       LLM cite bien solo desde el prompt): así el campo siempre refleja qué
       chunks entraron al contexto, aunque el LLM olvide mencionarlos.
-    - _build_llm() se duplica desde product_agent.py en vez de extraerse a un
-      factory común: recién ahora hay un segundo agente que lo necesita, y la
-      guía pide no construir infraestructura especulativa antes de que haga
-      falta. Vale la pena extraerlo cuando llegue el tercer agente (security).
+    - Cliente LLM vía agents/llm_factory.py (build_llm): con security_agent.py
+      (agente 3/6) llegó el tercer agente que necesita un cliente LLM, así
+      que la copia local de _build_llm() que tenía este archivo se extrajo al
+      factory común en vez de seguir duplicándose.
     - method="function_calling" y temperature=0, mismas razones que
       product_agent.py (modelo gratuito de OpenRouter más tolerante a ese
       modo; salida determinista para un documento técnico).
@@ -40,7 +40,6 @@ import sys
 from pathlib import Path
 
 from langchain_core.messages import HumanMessage, SystemMessage
-from langchain_openai import ChatOpenAI
 from pydantic import BaseModel, Field
 
 if __package__ in (None, ""):
@@ -51,6 +50,7 @@ if __package__ in (None, ""):
 
 from dotenv import load_dotenv
 
+from agents.llm_factory import build_llm
 from graph.state import EngineeringState, create_initial_state
 from observability.langfuse_config import flush_traces, observe
 from rag.retrievers import get_architecture_retriever
@@ -119,22 +119,6 @@ class ArchitectureProposal(BaseModel):
     )
 
 
-def _build_llm() -> ChatOpenAI:
-    """Construye el cliente LLM apuntando a OpenRouter vía variables de entorno."""
-    api_key = os.getenv("OPENROUTER_API_KEY")
-    if not api_key:
-        raise ValueError(
-            "OPENROUTER_API_KEY no está configurada. Copia .env.example a .env "
-            "y completa OPENROUTER_API_KEY antes de correr architect_agent."
-        )
-    return ChatOpenAI(
-        model=os.getenv("LLM_MODEL_NAME", "nvidia/nemotron-3.5-lightning:free"),
-        base_url=os.getenv("LLM_BASE_URL", "https://openrouter.ai/api/v1"),
-        api_key=api_key,
-        temperature=0,
-    )
-
-
 def _format_context(docs) -> str:
     """Arma el bloque de contexto RAG a partir de los chunks recuperados."""
     if not docs:
@@ -175,7 +159,7 @@ def architect_agent(state: EngineeringState) -> dict:
     contexto = _format_context(docs)
     fuentes = sorted({doc.metadata.get("source") for doc in docs if doc.metadata.get("source")})
 
-    llm = _build_llm()
+    llm = build_llm()
     structured_llm = llm.with_structured_output(ArchitectureProposal, method="function_calling")
 
     mensaje_usuario = (

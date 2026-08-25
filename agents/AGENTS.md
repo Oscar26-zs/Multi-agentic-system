@@ -166,7 +166,7 @@ Mismo patrón que el Product Agent: un **update parcial** del estado compartido.
 - **RAG sí, MCP todavía no.** El arquitecto necesita conocimiento (las guías del equipo) pero no necesita tocar código real todavía — eso es trabajo del Developer Agent (agente 4/6, Fase 5 del MCP). Introducir una sola dependencia nueva a la vez es la regla de oro de la Fase 6: si algo falla acá, ya se sabe que el sospechoso es el RAG o el LLM, no el MCP.
 - **La consulta al retriever se arma desde la especificación, no es una pregunta fija.** Así cada ejecución busca lo relevante a ESE requerimiento puntual, en vez de traer siempre el mismo fragmento genérico de las guías.
 - **`fuentes_consultadas` se recalcula después del LLM, no se le pide "de memoria".** Decisión explicada arriba: la fuente de verdad de qué contexto entró es el retriever, no lo que el LLM decida recordar.
-- **`_build_llm()` se duplica desde `product_agent.py` en vez de extraerse a un módulo común.** Recién con este segundo agente existe una segunda necesidad real de un cliente LLM; extraerlo ahora a un factory compartido sería tocar `product_agent.py` sin necesidad y construir infraestructura especulativa antes de que la pida un tercer caso de uso (`security_agent.py`, agente 3/6).
+- **`_build_llm()` se duplicó desde `product_agent.py` en su momento, en vez de extraerse a un módulo común.** Con este segundo agente solo existía una segunda necesidad real de un cliente LLM; extraerlo antes habría sido tocar `product_agent.py` sin necesidad y construir infraestructura especulativa antes de que la pidiera un tercer caso de uso. Ese tercer caso de uso llegó con `security_agent.py` (agente 3/6): ahí es donde la duplicación se resolvió, extrayendo `agents/llm_factory.py` y migrando tanto `product_agent.py` como este archivo a importar `build_llm()` desde ahí.
 - **`temperature=0` y `method="function_calling"`**: mismas razones que el Product Agent — salida determinista para un documento técnico, y compatibilidad con un modelo gratuito de OpenRouter más tolerante a ese modo que al JSON-schema estricto.
 - **`@observe(name="architect_agent")`**: cada corrida queda trazada en Langfuse — incluyendo, vía el LLM call interno, qué contexto RAG se le pasó al modelo. Eso permite depurar no solo "qué respondió el LLM" sino también "qué le dieron para leer".
 
@@ -183,6 +183,94 @@ Al correrse directamente (`python agents/architect_agent.py`), el agente se prue
 
 ---
 
+## 3. Security Agent (`agents/security_agent.py`)
+
+La propuesta que entrega el Architect Agent (`architecture`) llega ahora a la mesa del **ingeniero de seguridad del estudio**. No revisa código todavía — el Developer Agent (agente 4/6) ni siquiera existe en el pipeline en este punto — revisa el **diseño**: ¿qué pasa si este plano, tal como está escrito, se construye tal cual? ¿Hay un control de acceso roto, un cálculo de negocio que confía en el cliente, un dato sensible sin proteger? Es la última estación antes de que alguien escriba una sola línea de código real.
+
+Es el **agente 3 de 6** en el orden de construcción de la Fase 6. Introduce una única dependencia nueva respecto al Architect Agent: el retriever de seguridad (`get_security_retriever`, ya probado aislado en Fase 4) — mismo patrón de RAG que ya se usaba, apuntando a un dominio distinto. Deliberadamente **no** introduce MCP todavía: el MCP (Fase 5) sirve para operar sobre archivos reales del repo, y en este punto del pipeline el repo real todavía no tiene cambios que revisar — eso llega recién con el Developer Agent.
+
+### Qué hace, paso a paso
+
+**1. Recibe la arquitectura (y la especificación, como contexto adicional)**
+
+```python
+architecture = state["architecture"]
+specification = state.get("specification", {})
+```
+
+El insumo principal es lo que dejó el arquitecto. Si `architecture` está vacío, el agente se niega a trabajar (`raise ValueError`): un ingeniero de seguridad no puede auditar un plano que no existe. La `specification` se lee también, pero solo como contexto complementario (ej. qué riesgos funcionales ya había señalado el analista) — no es obligatoria por sí sola.
+
+**2. Va a la biblioteca de seguridad antes de opinar (RAG)**
+
+```python
+retriever = get_security_retriever()
+docs = retriever.invoke(consulta_rag)
+```
+
+Mismo mecanismo que el Architect Agent, pero contra `knowledge/security/` (`security-guidelines.md`, `owasp-guidelines.md`) en vez de `knowledge/architecture/`. La consulta se arma combinando el resumen y los componentes de la `architecture`, más los riesgos que ya había anotado la `specification` — así la búsqueda apunta a lo que ESTE diseño puntual necesita auditar, no a una checklist genérica de seguridad.
+
+**3. Consulta al "experto" (LLM) con la arquitectura + la especificación + lo que trajo de la biblioteca**
+
+`_SYSTEM_PROMPT` le da al LLM el rol de ingeniero de seguridad senior: evaluar control de acceso, autenticación, dónde vive cada validación (cliente vs. servidor), datos sensibles, auditoría y condiciones de carrera — y, algo específico de este agente, distinguir un **hallazgo real** de un **riesgo aceptado explícitamente fuera de alcance** (`knowledge/security/security-guidelines.md` documenta, por ejemplo, que la recuperación de contraseña o la auditoría de login quedan fuera del MVP). Sin esa distinción, un LLM de seguridad tiende a reportar como "hallazgo" cualquier cosa que le falte al diseño, aunque el equipo ya haya decidido conscientemente no cubrirla todavía.
+
+**4. Obliga al LLM a responder con una forma fija (structured output)**
+
+`SecurityReview` es el formulario:
+
+| Campo | Qué captura | Analogía |
+|---|---|---|
+| `resumen` | 1-2 frases del veredicto de seguridad general | El "concepto" del informe de auditoría |
+| `hallazgos` | Lista de `{severidad, categoria_owasp, descripcion, recomendacion}` | Cada bandera roja levantada, con su ficha completa |
+| `riesgos_aceptados` | Riesgos reconocidos pero fuera de alcance según las guías | Las notas "esto lo sabemos, pero no es para esta versión" |
+| `fuentes_consultadas` | Documentos de `knowledge/security/` usados | La bibliografía del informe |
+| `aprobado` | `True`/`False` según si hay hallazgos bloqueantes | El sello final del auditor |
+
+Igual que `decisiones_tecnicas` en el Architect Agent, `hallazgos` es una lista de objetos y no de strings sueltos: cada hallazgo tiene que traer su severidad, su categoría OWASP (o `"N/A"` si no aplica) y una recomendación accionable — nunca solo una frase de alerta suelta.
+
+**5. No confía en que el LLM cite bien sus fuentes ni se autocalifique**
+
+```python
+security_review["fuentes_consultadas"] = fuentes or security_review["fuentes_consultadas"]
+security_review["aprobado"] = not any(
+    h["severidad"] in _SEVERIDADES_BLOQUEANTES for h in security_review["hallazgos"]
+)
+```
+
+Mismo principio que `fuentes_consultadas` en el Architect Agent, aplicado dos veces acá: las fuentes se recalculan desde lo que el retriever realmente devolvió, y **`aprobado` se recalcula en Python, nunca se le pide al LLM que se autoevalúe**. Es la diferencia entre confiar en que un auditor diga "todo bien" de palabra y contar objetivamente cuántas banderas rojas de severidad `critica` o `alta` dejó escritas en su propio informe — si el LLM lista un hallazgo crítico pero "olvida" marcar `aprobado=False`, el campo derivado lo corrige igual.
+
+**6. Entrega solo su parte del expediente**
+
+```python
+return {
+    "security_review": security_review,
+    "messages": [...],
+}
+```
+
+Mismo patrón que los dos agentes anteriores: un **update parcial** del estado compartido (`security_review`), sin tocar `specification` ni `architecture`, dejando la puerta abierta para que el Developer Agent (agente 4/6) lea este informe antes de escribir código, y para que el Reviewer, más adelante, use `security_review["aprobado"]` como una de las señales de su veredicto final.
+
+### Por qué está construido así (decisiones clave)
+
+- **RAG de seguridad sí, MCP todavía no.** Según la tabla de la Fase 6 (`Guia_Construccion.md`), este agente introduce una única dependencia nueva a la vez — el retriever de seguridad — y explícitamente no necesita MCP para este análisis: audita una propuesta de diseño (texto estructurado en el estado), no archivos reales del repo. El MCP entra recién con el Developer Agent (agente 4/6), que sí lee/escribe código.
+- **`riesgos_aceptados` como campo separado de `hallazgos`.** Decisión explicada arriba: sin un lugar correcto para "esto está fuera de alcance a propósito", el LLM contamina el informe con hallazgos que no son accionables para nadie (ya se decidió no resolverlos en esta versión).
+- **`aprobado` se calcula en Python después del LLM, nunca se le pide "de memoria" al modelo.** Mismo principio que `fuentes_consultadas` en `architect_agent.py`: la fuente de verdad de si el diseño pasa o no es la lista de hallazgos que el propio LLM ya escribió, contada de forma determinista — no una casilla adicional que el modelo podría marcar de forma inconsistente con su propia lista.
+- **`agents/llm_factory.py` nace con este agente.** `product_agent.py` y `architect_agent.py` documentaban explícitamente que duplicar `_build_llm()` era aceptable solo "hasta que un tercer caso de uso lo pidiera" — ese tercer caso de uso es `security_agent.py`. Ambos agentes anteriores se migraron para importar `build_llm()` desde el factory común en vez de seguir duplicando la función.
+- **`temperature=0` y `method="function_calling"`**: mismas razones que los agentes anteriores — salida determinista para un informe técnico, compatibilidad con el modelo gratuito de OpenRouter.
+- **`@observe(name="security_agent")`**: cada corrida queda trazada en Langfuse, incluyendo qué contexto de `knowledge/security/` se le pasó al modelo — útil para auditar no solo el veredicto sino también qué política concreta lo sustenta.
+
+### Cómo se prueba (el bloque `if __name__ == "__main__":`)
+
+Al correrse directamente (`python agents/security_agent.py`), el agente se prueba **solo**, sin pasar por el grafo:
+
+1. Verifica que exista `OPENROUTER_API_KEY`.
+2. Arma un estado con una `specification` y una `architecture` de prueba escritas a mano (simulando lo que entregarían el Product y el Architect Agent — no se invocan esos agentes, para mantener la prueba aislada).
+3. Confirma que el retriever de seguridad devuelve al menos un fragmento (si da 0 resultados, el error es del RAG — hay que correr `python rag/ingestion.py` antes — no del agente).
+4. Invoca `security_agent` de verdad (llamada real al LLM).
+5. Imprime el JSON resultante, valida que `hallazgos` y `fuentes_consultadas` no hayan quedado vacíos, y muestra el `aprobado` calculado.
+6. Fuerza el flush de traces a Langfuse antes de terminar.
+
+---
+
 ## Qué sigue
 
-El siguiente agente (`security_agent.py`, agente 3/6) va a **leer** la `architecture` que generó el Architect Agent, consultar el retriever de seguridad (`knowledge/security/`) y evaluar riesgos de seguridad sobre el diseño propuesto — mismo patrón de "una dependencia nueva a la vez" que trajo el RAG en el Architect Agent. Se documenta acá mismo, como una sección nueva, cuando se construya.
+El siguiente agente (`developer_agent.py`, agente 4/6) va a **leer** la `architecture` (y el `security_review`, para no reintroducir lo que el Security Agent ya marcó como hallazgo) y va a ser el primero en usar el servidor MCP (`mcp_server/server.py`, Fase 5) para leer y modificar código real del repo objetivo — la primera dependencia nueva del pipeline que no es RAG. Se documenta acá mismo, como una sección nueva, cuando se construya.

@@ -22,11 +22,10 @@ Decisiones (Fase 6 de Guia_Construccion.md, agente 1/6):
       (nemotron-3.5-lightning:free en OpenRouter) y más propenso a rechazar
       json_schema estricto. Si el smoke test falla con un error de schema,
       este es el primer parámetro a revisar.
-    - Cliente LLM (_build_llm) como helper privado de este archivo, no un
-      módulo compartido: todavía es el único agente que existe. Cuando
-      architect_agent.py (agente 2) también necesite un LLM, vale la pena
-      extraerlo a un factory común; no se hace ahora para no construir
-      infraestructura especulativa.
+    - Cliente LLM vía agents/llm_factory.py (build_llm), no un helper propio:
+      con security_agent.py (agente 3/6) ya hay tres agentes que necesitan un
+      cliente LLM, así que la duplicación original (_build_llm() copiada en
+      cada archivo) se extrajo a un factory común.
     - product_agent() devuelve un update parcial del estado (specification,
       messages), coherente con el reducer operator.add de "messages" en
       state.py, para que ya tenga forma de nodo de LangGraph cuando se
@@ -39,7 +38,6 @@ import sys
 from pathlib import Path
 
 from langchain_core.messages import HumanMessage, SystemMessage
-from langchain_openai import ChatOpenAI
 from pydantic import BaseModel, Field
 
 if __package__ in (None, ""):
@@ -50,6 +48,7 @@ if __package__ in (None, ""):
 
 from dotenv import load_dotenv
 
+from agents.llm_factory import build_llm
 from graph.state import EngineeringState, create_initial_state
 from observability.langfuse_config import flush_traces, observe
 
@@ -105,22 +104,6 @@ class ProductSpecification(BaseModel):
     )
 
 
-def _build_llm() -> ChatOpenAI:
-    """Construye el cliente LLM apuntando a OpenRouter vía variables de entorno."""
-    api_key = os.getenv("OPENROUTER_API_KEY")
-    if not api_key:
-        raise ValueError(
-            "OPENROUTER_API_KEY no está configurada. Copia .env.example a .env "
-            "y completa OPENROUTER_API_KEY antes de correr product_agent."
-        )
-    return ChatOpenAI(
-        model=os.getenv("LLM_MODEL_NAME", "nvidia/nemotron-3.5-lightning:free"),
-        base_url=os.getenv("LLM_BASE_URL", "https://openrouter.ai/api/v1"),
-        api_key=api_key,
-        temperature=0,
-    )
-
-
 @observe(name="product_agent")
 def product_agent(state: EngineeringState) -> dict:
     """Genera la especificación estructurada a partir de state["requirement"].
@@ -131,7 +114,7 @@ def product_agent(state: EngineeringState) -> dict:
     if not requirement or not requirement.strip():
         raise ValueError("state['requirement'] está vacío; no se puede generar una especificación.")
 
-    llm = _build_llm()
+    llm = build_llm()
     structured_llm = llm.with_structured_output(ProductSpecification, method="function_calling")
 
     specification = structured_llm.invoke(
