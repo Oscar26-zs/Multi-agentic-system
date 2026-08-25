@@ -50,7 +50,7 @@ if __package__ in (None, ""):
 
 from dotenv import load_dotenv
 
-from agents.llm_factory import build_llm
+from agents.llm_factory import invoke_structured
 from graph.state import EngineeringState, create_initial_state
 from observability.langfuse_config import flush_traces, observe
 from rag.retrievers import get_architecture_retriever
@@ -159,9 +159,6 @@ def architect_agent(state: EngineeringState) -> dict:
     contexto = _format_context(docs)
     fuentes = sorted({doc.metadata.get("source") for doc in docs if doc.metadata.get("source")})
 
-    llm = build_llm()
-    structured_llm = llm.with_structured_output(ArchitectureProposal, method="function_calling")
-
     mensaje_usuario = (
         "Especificación funcional (JSON):\n"
         f"{json.dumps(specification, ensure_ascii=False, indent=2)}\n\n"
@@ -169,11 +166,12 @@ def architect_agent(state: EngineeringState) -> dict:
         f"{contexto}"
     )
 
-    proposal = structured_llm.invoke(
+    proposal = invoke_structured(
+        ArchitectureProposal,
         [
             SystemMessage(content=_SYSTEM_PROMPT),
             HumanMessage(content=mensaje_usuario),
-        ]
+        ],
     )
 
     architecture = proposal.model_dump()
@@ -190,6 +188,8 @@ def architect_agent(state: EngineeringState) -> dict:
 
 
 if __name__ == "__main__":
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
     print("Fase 6 (agente 2/6) — smoke test de agents/architect_agent.py")
 
     print("1. Verificando OPENROUTER_API_KEY en el entorno...")

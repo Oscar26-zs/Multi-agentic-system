@@ -48,7 +48,7 @@ if __package__ in (None, ""):
 
 from dotenv import load_dotenv
 
-from agents.llm_factory import build_llm
+from agents.llm_factory import invoke_structured
 from graph.state import EngineeringState, create_initial_state
 from observability.langfuse_config import flush_traces, observe
 
@@ -114,14 +114,12 @@ def product_agent(state: EngineeringState) -> dict:
     if not requirement or not requirement.strip():
         raise ValueError("state['requirement'] está vacío; no se puede generar una especificación.")
 
-    llm = build_llm()
-    structured_llm = llm.with_structured_output(ProductSpecification, method="function_calling")
-
-    specification = structured_llm.invoke(
+    specification = invoke_structured(
+        ProductSpecification,
         [
             SystemMessage(content=_SYSTEM_PROMPT),
             HumanMessage(content=requirement),
-        ]
+        ],
     )
 
     return {
@@ -134,6 +132,12 @@ def product_agent(state: EngineeringState) -> dict:
 
 
 if __name__ == "__main__":
+    # La consola de Windows suele usar cp1252, que no puede imprimir todos los
+    # caracteres Unicode que puede devolver el LLM (ej. guiones especiales);
+    # sin esto, un print() a mitad del smoke test puede tronar con
+    # UnicodeEncodeError aunque el agente haya funcionado bien.
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
     print("Fase 6 (agente 1/6) — smoke test de agents/product_agent.py")
 
     print("1. Verificando OPENROUTER_API_KEY en el entorno...")

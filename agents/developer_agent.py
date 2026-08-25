@@ -87,7 +87,7 @@ if __package__ in (None, ""):
     # repo, y "from graph.state import ..." fallaría con ModuleNotFoundError.
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from agents.llm_factory import build_llm
+from agents.llm_factory import build_llm, invoke_structured
 from agents.mcp_tools import (
     REPO_ROOT,
     mcp_server_params,
@@ -283,8 +283,9 @@ def developer_agent(state: EngineeringState) -> dict:
         _run_tool_loop(mensaje_usuario)
     )
 
-    structured_llm = build_llm().with_structured_output(ImplementationSummary, method="function_calling")
-    summary = structured_llm.invoke(messages + [HumanMessage(content=_SUMMARY_PROMPT)])
+    summary = invoke_structured(
+        ImplementationSummary, messages + [HumanMessage(content=_SUMMARY_PROMPT)]
+    )
 
     implementation = {
         "resumen": summary.resumen,
@@ -307,6 +308,8 @@ def developer_agent(state: EngineeringState) -> dict:
 
 
 if __name__ == "__main__":
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
     print("Fase 6 (agente 4/6) — smoke test de agents/developer_agent.py")
 
     print("1. Verificando OPENROUTER_API_KEY en el entorno...")

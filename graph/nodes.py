@@ -93,6 +93,8 @@ reviewer_agent_node = _wrap(reviewer_agent, "reviewer_agent")
 
 
 if __name__ == "__main__":
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
     from graph.state import create_initial_state
 
     print("Fase 7 (paso 1/3) — smoke test de graph/nodes.py")
