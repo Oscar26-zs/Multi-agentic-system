@@ -31,12 +31,17 @@ Decisiones (Fase 6 de Guia_Construccion.md, agente 4/6):
       sandboxeadas del lado del servidor sin que este archivo conozca rutas
       absolutas del repo objetivo.
     - Las tools MCP listadas por el servidor (`session.list_tools()`) se
-      convierten a schema OpenAI-tools al vuelo (`_tool_to_schema`) y se
-      bindean al LLM con `bind_tools()` — no se usa un adapter de terceros
-      (`langchain-mcp-adapters` no está en requirements.txt): el schema de
-      una `mcp.types.Tool` (name/description/input_schema) ya calza 1:1 con
-      el formato `{"type": "function", "function": {...}}` que
-      `bind_tools()` espera, así que no hace falta una dependencia extra.
+      convierten a schema OpenAI-tools al vuelo (`agents/mcp_tools.py ->
+      tool_to_openai_schema`) y se bindean al LLM con `bind_tools()` — no se
+      usa un adapter de terceros (`langchain-mcp-adapters` no está en
+      requirements.txt): el schema de una `mcp.types.Tool`
+      (name/description/input_schema) ya calza 1:1 con el formato
+      `{"type": "function", "function": {...}}` que `bind_tools()` espera,
+      así que no hace falta una dependencia extra.
+    - La plomería de conexión MCP (lanzar el servidor, convertir tools,
+      trackear create_file/update_file) vive en agents/mcp_tools.py, no en
+      este archivo: se extrajo cuando testing_agent.py (agente 5/6) necesitó
+      exactamente el mismo ciclo — mismo criterio que agents/llm_factory.py.
     - Ciclo ReAct manual con límite `MAX_TOOL_ITERATIONS`: en cada vuelta se
       invoca al LLM con tools bindeadas: si no pide más tool calls, corta.
       Si el límite se agota igual se sigue al resumen final (con lo hecho
@@ -65,7 +70,6 @@ Decisiones (Fase 6 de Guia_Construccion.md, agente 4/6):
 """
 
 import asyncio
-import difflib
 import json
 import os
 import sys
@@ -73,7 +77,7 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
-from mcp import ClientSession, StdioServerParameters
+from mcp import ClientSession
 from mcp.client.stdio import stdio_client
 from pydantic import BaseModel, Field
 
@@ -84,6 +88,14 @@ if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from agents.llm_factory import build_llm
+from agents.mcp_tools import (
+    REPO_ROOT,
+    mcp_server_params,
+    result_text,
+    summarize_args,
+    tool_to_openai_schema,
+    track_file_change,
+)
 from graph.state import EngineeringState, create_initial_state
 from observability.langfuse_config import flush_traces, observe
 from rag.retrievers import get_development_retriever
@@ -92,7 +104,6 @@ load_dotenv()
 
 __all__ = ["ImplementationSummary", "developer_agent"]
 
-REPO_ROOT = Path(__file__).resolve().parent.parent
 MAX_TOOL_ITERATIONS = 12
 _TOOL_RESULT_CHAR_LIMIT = 4000
 
@@ -169,86 +180,6 @@ def _format_context(docs) -> str:
     return "\n\n".join(partes)
 
 
-def _mcp_server_params() -> StdioServerParameters:
-    """Parámetros para lanzar mcp_server.server como subproceso stdio.
-
-    cwd=REPO_ROOT (raíz de este workspace, NO el repo objetivo): el propio
-    servidor resuelve REPO_TARGET_PATH desde su .env al arrancar, igual que
-    en tests/test_mcp_protocol.py.
-    """
-    return StdioServerParameters(
-        command=sys.executable,
-        args=["-m", "mcp_server.server"],
-        cwd=str(REPO_ROOT),
-    )
-
-
-def _tool_to_schema(tool) -> dict:
-    """Convierte una mcp.types.Tool al formato {"type": "function", ...} de bind_tools."""
-    return {
-        "type": "function",
-        "function": {
-            "name": tool.name,
-            "description": tool.description or "",
-            "parameters": tool.input_schema,
-        },
-    }
-
-
-def _result_text(result) -> str:
-    return "".join(getattr(chunk, "text", "") for chunk in getattr(result, "content", []))
-
-
-def _unified_diff(old_text: str, new_text: str, file_path: str) -> str:
-    diff_lines = difflib.unified_diff(
-        old_text.splitlines(keepends=True),
-        new_text.splitlines(keepends=True),
-        fromfile=f"a/{file_path}",
-        tofile=f"b/{file_path}",
-    )
-    return "".join(diff_lines)
-
-
-def _summarize_args(args: dict) -> str:
-    if "file_path" in args:
-        return args["file_path"]
-    if "subpath" in args:
-        return args.get("subpath") or "(raíz)"
-    if "query" in args:
-        return repr(args["query"])
-    return json.dumps(args, ensure_ascii=False)
-
-
-def _track_change(
-    tool_call: dict,
-    result_text: str,
-    is_error: bool,
-    diffs: dict,
-    archivos_creados: set,
-    archivos_modificados: set,
-) -> None:
-    """Registra el diff real de create_file/update_file; no-op para tools de lectura o errores."""
-    if is_error:
-        return
-    name = tool_call["name"]
-    args = tool_call.get("args", {})
-
-    if name == "create_file":
-        file_path = args.get("file_path", "")
-        content = args.get("content", "")
-        diffs[file_path] = _unified_diff("", content, file_path)
-        if "reemplazado" in result_text:
-            archivos_modificados.add(file_path)
-        else:
-            archivos_creados.add(file_path)
-    elif name == "update_file":
-        file_path = args.get("file_path", "")
-        old_text = args.get("old_text", "")
-        new_text = args.get("new_text", "")
-        diffs[file_path] = _unified_diff(old_text, new_text, file_path)
-        archivos_modificados.add(file_path)
-
-
 def _format_diffs(diffs: dict) -> str:
     if not diffs:
         return "(sin cambios de archivo aplicados)"
@@ -260,11 +191,11 @@ async def _run_tool_loop(mensaje_usuario: str) -> tuple[list, list[str], list[st
 
     Devuelve (messages, archivos_creados, archivos_modificados, diffs, pasos_seguidos).
     """
-    async with stdio_client(_mcp_server_params()) as (read, write):
+    async with stdio_client(mcp_server_params()) as (read, write):
         async with ClientSession(read, write) as session:
             await session.initialize()
             tools_result = await session.list_tools()
-            tool_schemas = [_tool_to_schema(t) for t in tools_result.tools]
+            tool_schemas = [tool_to_openai_schema(t) for t in tools_result.tools]
 
             llm_with_tools = build_llm().bind_tools(tool_schemas)
             messages: list = [
@@ -286,12 +217,16 @@ async def _run_tool_loop(mensaje_usuario: str) -> tuple[list, list[str], list[st
                     result = await session.call_tool(
                         tool_call["name"], tool_call.get("args", {})
                     )
-                    text = _result_text(result)
+                    text = result_text(result)
                     is_error = bool(getattr(result, "is_error", False))
-                    _track_change(tool_call, text, is_error, diffs, archivos_creados, archivos_modificados)
+                    change = track_file_change(tool_call, text, is_error)
+                    if change is not None:
+                        file_path, bucket, diff = change
+                        diffs[file_path] = diff
+                        (archivos_creados if bucket == "creado" else archivos_modificados).add(file_path)
                     estado = "ERROR" if is_error else "OK"
                     pasos.append(
-                        f"{tool_call['name']}({_summarize_args(tool_call.get('args', {}))}) -> {estado}"
+                        f"{tool_call['name']}({summarize_args(tool_call.get('args', {}))}) -> {estado}"
                     )
                     messages.append(
                         ToolMessage(

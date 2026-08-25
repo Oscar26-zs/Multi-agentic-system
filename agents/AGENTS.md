@@ -397,6 +397,101 @@ Al correrse directamente (`python agents/developer_agent.py`), el agente se prue
 
 ---
 
+## `agents/mcp_tools.py` — plomería MCP compartida (nace con el agente 5)
+
+Con `testing_agent.py` (agente 5/6) apareció el segundo agente que necesita exactamente el mismo ciclo ReAct contra el servidor MCP que ya usaba `developer_agent.py` (agente 4/6): lanzar el servidor como subproceso, convertir sus tools al formato de `bind_tools()`, leer el resultado de una tool call, y trackear qué archivo se creó/modificó. Duplicar esa plomería una segunda vez ya no se justificaba — mismo criterio que llevó a extraer `agents/llm_factory.py` con el tercer agente que necesitó un cliente LLM.
+
+`agents/mcp_tools.py` centraliza:
+- `mcp_server_params()` — parámetros para lanzar `python -m mcp_server.server` como subproceso stdio.
+- `tool_to_openai_schema(tool)` — convierte una `mcp.types.Tool` al formato `{"type": "function", ...}`.
+- `result_text(result)` — extrae el texto de un `CallToolResult`.
+- `summarize_args(args)` — representación corta de argumentos, para bitácora legible.
+- `unified_diff(old, new, file_path)` y `track_file_change(tool_call, text, is_error)` — detectan si una tool call fue un `create_file`/`update_file` exitoso y devuelven `(file_path, bucket, diff)`; cada agente decide qué hacer con eso (`developer_agent.py` guarda el diff completo, `testing_agent.py` solo necesita saber qué archivo se tocó).
+
+`developer_agent.py` se migró para importar estas funciones en vez de mantener su copia local (`_mcp_server_params`, `_tool_to_schema`, `_result_text`, `_unified_diff`, `_track_change` desaparecieron de ese archivo).
+
+---
+
+## 5. Testing Agent (`agents/testing_agent.py`)
+
+Lo que implementó el Developer Agent (`implementation`) llega ahora a la mesa del **QA engineer del estudio**. Es el primer agente que no solo lee/escribe información — **verifica objetivamente** si algo funciona, corriendo pruebas reales sobre el repositorio real, no describiendo lo que "debería" pasar.
+
+Es el **agente 5 de 6** en el orden de construcción de la Fase 6. Introduce una única tool nueva: **`run_tests`**, agregada a `mcp_server/server.py` en este mismo paso (su docstring decía explícitamente "run_tests y get_diff se agregarán después" — get_diff sigue sin agregarse, `developer_agent.py` nunca la necesitó). El resto de la plomería (conexión MCP, ciclo ReAct, tools bindeadas) es la misma que `developer_agent.py`, ahora compartida vía `agents/mcp_tools.py`.
+
+### La tool nueva: `run_tests` (`mcp_server/server.py`)
+
+```python
+@server.tool()
+def run_tests(subpath: str = "", filter: str = "") -> dict:
+    ...
+    cmd = ["dotnet", "test", str(base), "--nologo"]
+    proc = subprocess.run(cmd, cwd=ROOT, capture_output=True, text=True, timeout=RUN_TESTS_TIMEOUT_SECONDS)
+    ...
+```
+
+Corre `dotnet test` de verdad (vía `subprocess.run`, con timeout — `RUN_TESTS_TIMEOUT_SECONDS`, default 300s, para que un test colgado no cuelgue también al agente) sobre `subpath` (o la raíz del repo si no se especifica) y parsea con una regex (`_DOTNET_TEST_SUMMARY_RE`) las líneas de resumen que `dotnet test` imprime por cada proyecto de test, ej.:
+
+```
+Failed!  - Failed:     1, Passed:     2, Skipped:     0, Total:     3, Duration: 422 ms - Smoke.Tests.dll (net10.0)
+```
+
+Suma `passed`/`failed`/`skipped`/`total` de TODAS las líneas que aparezcan (una solución con varios proyectos de test imprime una por proyecto). Se validó en la práctica contra un proyecto xUnit real (2 tests que pasan, 1 diseñado para fallar): `run_tests("Smoke.Tests")` devolvió `{"passed": 2, "failed": 1, "total": 3, "exit_code": 1, ...}`, coincidiendo exactamente con la salida real de `dotnet test`.
+
+### Qué hace el agente, paso a paso
+
+**1. Recibe la implementación (y especificación + revisión de seguridad, como contexto opcional)**
+
+```python
+implementation = state["implementation"]
+specification = state.get("specification", {})
+security_review = state.get("security_review", {})
+```
+
+`implementation` es obligatoria (si está vacía, `raise ValueError`: no hay nada que probar sin que el Developer Agent haya corrido antes). `specification` (criterios de aceptación) y `security_review` (hallazgos) son opcionales, leídas con `state.get(...)`.
+
+Un detalle de **orden de ejecución** distinto al del Developer Agent: el pipeline real del grafo es `Product → Architect → Developer → Security → Testing → Reviewer` (ver `README.md`) — a diferencia de Developer (que corre ANTES que Security y por eso no puede depender de `security_review`), cuando Testing corre, Security ya corrió. Por eso este agente sí puede usar `security_review["hallazgos"]` como contexto: `knowledge/testing/testing-strategy.md` pide explícitamente cubrir con test los "casos de abuso" (auto-aprobación, IDOR, forced browsing...), y esos hallazgos son la señal más directa de cuáles priorizar. Se lee opcionalmente y no como dependencia dura para que el agente siga siendo probable de forma aislada (Fase 6) con solo una `implementation` de prueba.
+
+**2. Va a la biblioteca de testing antes de decidir qué correr (RAG)**
+
+Mismo mecanismo que los agentes anteriores, contra `knowledge/testing/testing-strategy.md`, con la consulta armada desde el resumen y archivos de la implementación, los criterios de aceptación y las descripciones de los hallazgos de seguridad.
+
+**3-4. Se conecta al MCP y bindea las tools — igual que Developer, vía `agents/mcp_tools.py`**
+
+**5. Corre el mismo ciclo ReAct, pero con una obligación explícita en el prompt**
+
+```
+Es OBLIGATORIO invocar la tool run_tests al menos una vez antes de
+terminar [...] No has terminado tu trabajo hasta que hayas corrido
+run_tests de verdad y visto un resultado real.
+```
+
+A diferencia de `developer_agent.py` (donde "no hizo nada" ya se ve reflejado en `archivos_creados` vacío), acá un ciclo que solo explora sin nunca correr `run_tests` produce un reporte con `aprobado=False` y cero tests — indistinguible de "no se pudo verificar nada". Por eso el prompt lo deja explícito en vez de confiar en que el modelo lo infiera solo.
+
+**6. Nunca le pregunta al LLM cuántos tests pasaron — lo cuenta él mismo**
+
+```python
+def _aggregate_run_tests(run_tests_calls: list[dict]) -> dict:
+    totals = {"passed": 0, "failed": 0, "skipped": 0, "total": 0}
+    ...
+    aprobado = bool(run_tests_calls) and totals["failed"] == 0 and totals["total"] > 0 and not algun_timeout
+```
+
+Cada llamada real y exitosa a `run_tests` que el LLM ejecutó se captura (`json.loads` sobre el texto que devuelve la tool) en `run_tests_calls`; `_aggregate_run_tests()` suma sus totales en Python. Es la aplicación más crítica hasta ahora del principio "no confiar en la memoria del modelo para hechos verificables" (mismo que `archivos_creados` en Developer, `aprobado` en Security): un número de tests pasados inventado por el LLM sería particularmente engañoso para el Reviewer, que lo usa como señal objetiva de si la implementación funciona.
+
+`aprobado` exige explícitamente `total > 0`, no solo `failed == 0` — "no se encontraron/corrieron tests" NO es lo mismo que "los tests pasan", aunque ambos casos den `failed=0`.
+
+**7. Solo le pide criterio al LLM para la parte que sí lo requiere**
+
+`TestingSummary` (structured output, en una llamada aparte después del ciclo): `resumen`, `casos_generados` (tests nuevos que agregó, si hubo), `hallazgos` (criterios sin cobertura, fallos relevantes) y `notas`. Todo lo numérico/verificable (`passed`/`failed`/`skipped`/`total`/`aprobado`, `archivos_creados`, `archivos_modificados`, `pasos_seguidos`, `comandos_ejecutados`) se calcula en Python y se copia tal cual al `test_results` final.
+
+### Cómo se prueba (el bloque `if __name__ == "__main__":`)
+
+Igual que `developer_agent.py`: preflight de `OPENROUTER_API_KEY` y `REPO_TARGET_PATH`, estado con `implementation` de prueba escrita a mano (simulando al Developer Agent), confirma que el retriever de testing devuelve resultados, invoca `testing_agent` de verdad (LLM real + MCP real + `dotnet test` real) y valida que `pasos_seguidos`/`comandos_ejecutados`/`total` no queden vacíos.
+
+**Validación durante la construcción:** se armó un sandbox temporal con un proyecto xUnit real (`Smoke.Tests`, 2 tests que pasan + 1 diseñado para fallar) y se confirmó que `mcp_server.server.run_tests()` devuelve el pass/fail exacto (`passed=2, failed=1, total=3`) llamándolo directamente. La corrida completa del agente (ciclo ReAct de punta a punta vía LLM) quedó bloqueada por el límite diario gratuito de OpenRouter (`Rate limit exceeded: free-models-per-day`) antes de completarse — la tool MCP y el patrón de ciclo ReAct están validados (es el mismo que ya se probó de punta a punta en `developer_agent.py`), pero la corrida específica de `testing_agent.py` con LLM real queda pendiente de repetirse cuando se libere el límite (reinicia diariamente) o se agreguen créditos a la cuenta de OpenRouter.
+
+---
+
 ## Qué sigue
 
-El siguiente agente (`testing_agent.py`, agente 5/6) va a **leer** la `implementation` que dejó el Developer Agent y va a usar la tool MCP `run_tests` (que hay que agregar a `mcp_server/server.py`, ya que hoy solo existen `list_files`/`read_file`/`search_code`/`create_file`/`update_file`) para correr las pruebas reales del repo objetivo y reportar pass/fail. Se documenta acá mismo, como una sección nueva, cuando se construya.
+El siguiente agente (`reviewer_agent.py`, agente 6/6) va a **leer** todo el estado acumulado (`specification`, `architecture`, `implementation`, `security_review`, `test_results`) y va a emitir el veredicto final: `APPROVED` o `REJECTED` con `return_to`, sin depender de RAG ni de MCP — es el único agente que solo lee el resto del estado. Se documenta acá mismo, como una sección nueva, cuando se construya.

@@ -1,4 +1,4 @@
-"""Servidor MCP sobre el clon del repo MVC (Fase 5 + escritura anticipada).
+"""Servidor MCP sobre el clon del repo MVC (Fase 5 + escritura anticipada + Fase 6 run_tests).
 
 Qué hace:
     Implementa un servidor Model Context Protocol que expone tools para
@@ -7,14 +7,18 @@ Qué hace:
         - Escritura: create_file (archivos nuevos, p. ej. documentacion de
           cambios en .md) y update_file (reemplazo quirurgico y unico de un
           fragmento de codigo existente).
+        - Ejecucion: run_tests (corre `dotnet test` real sobre el repositorio
+          o una subcarpeta/proyecto y devuelve pass/fail estructurado).
     Todas las rutas se resuelven contra el clon local definido en
     REPO_TARGET_PATH (.env); ninguna tool puede escapar de esa raiz
     (sandboxing propio + proteccion nativa del SDK).
 
 Responsabilidad dentro del sistema:
-    Unica via por la que los agentes leen y modifican codigo real; aisla el
-    acceso al filesystem detras de tools MCP auditables. run_tests y
-    get_diff se agregaran despues (Fase 6) sobre esta misma base.
+    Unica via por la que los agentes leen, modifican y prueban codigo real;
+    aisla el acceso al filesystem y al proceso `dotnet` detras de tools MCP
+    auditables. get_diff no se agrega: developer_agent.py calcula sus propios
+    diffs con difflib a partir de lo que create_file/update_file recibieron
+    como argumento, sin necesitar una tool adicional.
 
 Detalles de robustez:
     - Encoding preservado: detecta UTF-16 con BOM (tipico de Visual Studio
@@ -22,6 +26,10 @@ Detalles de robustez:
       formato para no corromper archivos.
     - Line endings: update_file adapta el texto nuevo al EOL dominante del
       archivo (CRLF vs LF) para evitar diffs gigantes.
+    - run_tests corre con timeout (RUN_TESTS_TIMEOUT_SECONDS, default 300s)
+      para que un test colgado no cuelgue tambien al agente que lo invoca; al
+      expirar devuelve timed_out=True en vez de lanzar una excepcion, para
+      que el Testing Agent pueda reportarlo como hallazgo en vez de crashear.
 
 Ejecucion standalone (transporte stdio):
     python -m mcp_server.server
@@ -36,12 +44,21 @@ import asyncio
 import fnmatch
 import os
 import re
+import subprocess
 from pathlib import Path
 
 from dotenv import load_dotenv
 from mcp.server import MCPServer
 
 load_dotenv()
+
+RUN_TESTS_TIMEOUT_SECONDS = int(os.environ.get("RUN_TESTS_TIMEOUT_SECONDS", "300"))
+
+# Parsea la linea de resumen que "dotnet test" imprime por cada proyecto de
+# test, ej.: "Passed!  - Failed:     0, Passed:    12, Skipped:     0, Total:    12, Duration: 1 s"
+_DOTNET_TEST_SUMMARY_RE = re.compile(
+    r"(?:Passed|Failed)!\s*-\s*Failed:\s*(\d+),\s*Passed:\s*(\d+),\s*Skipped:\s*(\d+),\s*Total:\s*(\d+)"
+)
 
 # Raiz sandboxeada: unica zona del filesystem accesible por las tools.
 ROOT = Path(os.environ["REPO_TARGET_PATH"]).resolve()
@@ -108,6 +125,8 @@ server = MCPServer(
         "contenido (read_file) y busca codigo (search_code). Escritura: "
         "crea archivos nuevos como documentacion de cambios (create_file) "
         "y modifica fragmentos exactos de codigo existente (update_file). "
+        "Ejecucion: corre la suite de tests real con `dotnet test` "
+        "(run_tests) y devuelve pass/fail. "
         "Los cambios ocurren en la rama actual del clon local."
     ),
 )
@@ -273,6 +292,68 @@ def update_file(file_path: str, old_text: str, new_text: str) -> str:
         f"OK: {file_path} actualizado "
         f"(+{len(adapted_new)} chars, -{len(target_old)} chars)."
     )
+
+
+@server.tool()
+def run_tests(subpath: str = "", filter: str = "") -> dict:
+    """Corre `dotnet test` real sobre el repositorio (o una subcarpeta/proyecto).
+
+    Args:
+        subpath: subcarpeta o archivo .csproj/.sln desde donde correr los
+            tests ("" = raíz del repositorio, corre toda la solución).
+        filter: expresión de --filter de dotnet test (ej. "FullyQualifiedName~SolicitudVacaciones"),
+            para acotar a un subconjunto de tests; "" corre todos.
+
+    Devuelve {"command", "exit_code", "timed_out", "passed", "failed",
+    "skipped", "total", "raw_output"}. passed/failed/skipped/total se suman
+    de TODAS las líneas de resumen que dotnet test imprime (una por proyecto
+    de test si la solución tiene varios). raw_output queda recortado a los
+    últimos 8000 caracteres para no inundar el contexto del LLM que la invoca.
+    """
+    base = _safe_resolve(subpath)
+    if not base.exists():
+        raise FileNotFoundError(f"'{subpath}' no existe en el repositorio.")
+
+    cmd = ["dotnet", "test", str(base), "--nologo"]
+    if filter:
+        cmd += ["--filter", filter]
+
+    try:
+        proc = subprocess.run(
+            cmd,
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            timeout=RUN_TESTS_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired as exc:
+        output = (exc.stdout or "") + "\n" + (exc.stderr or "")
+        return {
+            "command": " ".join(cmd),
+            "exit_code": None,
+            "timed_out": True,
+            "passed": 0,
+            "failed": 0,
+            "skipped": 0,
+            "total": 0,
+            "raw_output": output[-8000:],
+        }
+
+    output = (proc.stdout or "") + "\n" + (proc.stderr or "")
+    totals = {"passed": 0, "failed": 0, "skipped": 0, "total": 0}
+    for failed, passed, skipped, total in _DOTNET_TEST_SUMMARY_RE.findall(output):
+        totals["failed"] += int(failed)
+        totals["passed"] += int(passed)
+        totals["skipped"] += int(skipped)
+        totals["total"] += int(total)
+
+    return {
+        "command": " ".join(cmd),
+        "exit_code": proc.returncode,
+        "timed_out": False,
+        **totals,
+        "raw_output": output[-8000:],
+    }
 
 
 if __name__ == "__main__":

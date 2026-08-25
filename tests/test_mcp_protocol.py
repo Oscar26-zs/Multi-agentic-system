@@ -23,7 +23,7 @@ from mcp_server.server import ROOT as CLONE_ROOT
 load_dotenv()
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-EXPECTED_TOOLS = ["create_file", "list_files", "read_file", "search_code", "update_file"]
+EXPECTED_TOOLS = ["create_file", "list_files", "read_file", "run_tests", "search_code", "update_file"]
 
 
 def _server_params() -> StdioServerParameters:
