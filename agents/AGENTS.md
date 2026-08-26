@@ -24,6 +24,20 @@ Ese "expediente" es el `EngineeringState` (definido en `graph/state.py`) — un 
 
 ---
 
+## `agents/llm_factory.py` — la factory compartida de LLM
+
+Los seis agentes necesitan lo mismo de un LLM (un cliente que responda, y en la mayoría de los casos una forma de forzar salida estructurada), así que esa pieza vive en un solo lugar en vez de duplicarse — ver la nota histórica de extracción en la sección del Security Agent más abajo. Lo que documento acá es el estado ACTUAL de ese archivo, que evolucionó más allá de esa extracción inicial tras un par de fallos reales en producción.
+
+**`build_llm(temperature=0)`** construye el cliente probando **4 proveedores gratuitos en cascada, en orden**: NVIDIA NIM → Groq → Google AI Studio → OpenRouter (último, como red de seguridad, porque es "el proveedor original, ya confirmado que funciona"). Cada proveedor solo se intenta si su variable `<PROVEEDOR>_API_KEY` está en el entorno, y se valida con un ping barato (`llm.invoke([HumanMessage(content="ping")])`) antes de devolverlo. Es la respuesta directa al problema de cuota compartida gratuita que topamos varias veces durante la construcción (`Rate limit exceeded: free-models-per-day` de OpenRouter): en vez de depender de un solo proveedor, se rota al siguiente si el que se está probando falla.
+
+**`invoke_structured(schema, messages, method="function_calling", temperature=0)`** es la función que product_agent, architect_agent, security_agent, reviewer_agent (y el resumen final de developer_agent/testing_agent) usan para pedir salida estructurada — **no** `build_llm().with_structured_output(schema).invoke(messages)` directo. Nace de un fallo real: un proveedor podía pasar el ping simple de `build_llm()` (responde texto plano sin problema) pero fallar en silencio al pedirle un schema Pydantic con objetos anidados — `with_structured_output()` devolvía `None` en vez de lanzar una excepción, y ese `None` recién explotaba más adelante con un `AttributeError` opaco al hacer `.model_dump()` dentro del agente. `invoke_structured()` mueve la validación al nivel de la llamada REAL (mismo orden de 4 proveedores): si un proveedor devuelve `None` o lanza una excepción generando el schema, prueba el siguiente antes de rendirse — y solo entonces le entrega al agente una instancia válida del schema.
+
+Ambas funciones reintentan una vez el MISMO proveedor (`_MAX_INTENTOS_POR_PROVEEDOR = 2`, con `time.sleep(2.0)` entre intentos) si el error es "reintentable" (`_es_reintentable`: 5xx, timeout, o error de red sin `status_code` — nunca un 4xx, porque un 401/404/400 no se arregla solo). Nace de un 504 real de NVIDIA en producción durante la construcción.
+
+**Por qué `developer_agent.py` y `testing_agent.py` siguen usando `build_llm()` directo (no `invoke_structured()`) para su ciclo ReAct:** la selección de proveedor se hace UNA sola vez por llamada; esos dos agentes hacen `build_llm().bind_tools(tool_schemas)` y **reusan ese mismo cliente durante todo el ciclo de tool-calling** — cambiar de proveedor a mitad de esa conversación rompería el formato de los tool calls ya emitidos. Solo su resumen final (`ImplementationSummary`/`TestingSummary`, después de cerrar el ciclo de tools) usa `invoke_structured()`, porque ahí sí es una llamada nueva e independiente.
+
+---
+
 ## 1. Product Agent (`agents/product_agent.py`)
 
 El Product Agent es la **primera estación**: es el único que no depende de nadie más (no necesita RAG, no necesita acceso al código, no necesita nada salvo el requerimiento original y un LLM). Por eso es el agente #1 en el orden de construcción de la Fase 6 — no tiene piezas externas que puedan fallar.
@@ -59,7 +73,14 @@ Un LLM normal respondería con un párrafo de texto libre — útil para un huma
 | `riesgos` | Casos borde, abusos posibles, datos sensibles | Las "banderas rojas" que el analista detecta |
 | `supuestos` | Qué asumió el analista ante ambigüedad | Las notas al margen: "asumí que..." |
 
-`llm.with_structured_output(ProductSpecification, method="function_calling")` es la instrucción que le dice al LLM: *"no me respondas con prosa libre, llena exactamente este formulario"*. El framework (`langchain`) se encarga de validar que la respuesta realmente tenga esa forma — si el LLM se "olvida" de un campo obligatorio, esto falla ruidosamente en vez de dejar pasar un documento incompleto.
+```python
+specification = invoke_structured(
+    ProductSpecification,
+    [SystemMessage(content=_SYSTEM_PROMPT), HumanMessage(content=requirement)],
+)
+```
+
+`invoke_structured(ProductSpecification, [...])` (ver la sección dedicada a `agents/llm_factory.py` más arriba) es la instrucción que le dice al LLM: *"no me respondas con prosa libre, llena exactamente este formulario"* — y además prueba varios proveedores gratuitos en cascada hasta que uno genere una respuesta estructurada válida, en vez de depender de uno solo. El framework (`langchain`) se encarga de validar que la respuesta realmente tenga esa forma — si el LLM se "olvida" de un campo obligatorio, esto falla ruidosamente en vez de dejar pasar un documento incompleto.
 
 **4. Entrega solo su parte del expediente**
 
@@ -76,7 +97,7 @@ El agente no devuelve el expediente completo — devuelve un **update parcial**:
 
 - **Nada de RAG, nada de MCP, nada de acceso a archivos.** Es deliberado: es el agente más simple posible, para poder probarlo aislado sin que un fallo en otra pieza (la base vectorial, el servidor MCP) contamine el diagnóstico. Es como probar el motor de un auto en un banco de pruebas antes de montarlo en el chasis.
 - **`temperature=0`** en el LLM: le pedimos que sea lo más determinista posible (menos "creativo", más consistente) porque estamos generando un documento técnico, no un texto creativo.
-- **`method="function_calling"`** en vez del modo estricto por defecto: el modelo usado (`nemotron-3.5-lightning:free`, gratuito en OpenRouter) es más propenso a rechazar el modo JSON-schema estricto. `function_calling` es una forma más "flexible" de pedir el mismo formulario, con más chance de que un modelo gratuito la entienda bien.
+- **`method="function_calling"`** en vez del modo estricto por defecto: los modelos gratuitos que prueba `agents/llm_factory.py` (NVIDIA NIM, Groq, Google AI Studio, OpenRouter) son más propensos a rechazar el modo JSON-schema estricto. `function_calling` es una forma más "flexible" de pedir el mismo formulario, con más chance de que un modelo gratuito la entienda bien — sea cual sea el proveedor que termine respondiendo.
 - **`@observe(name="product_agent")`**: cada vez que el agente corre, Langfuse registra cuánto tardó, qué prompt usó y qué devolvió — como una cámara de seguridad sobre el escritorio del analista, útil para depurar sin tener que confiar en la memoria de nadie.
 
 ### Cómo se prueba (el bloque `if __name__ == "__main__":`)
@@ -166,7 +187,7 @@ Mismo patrón que el Product Agent: un **update parcial** del estado compartido.
 - **RAG sí, MCP todavía no.** El arquitecto necesita conocimiento (las guías del equipo) pero no necesita tocar código real todavía — eso es trabajo del Developer Agent (agente 4/6, Fase 5 del MCP). Introducir una sola dependencia nueva a la vez es la regla de oro de la Fase 6: si algo falla acá, ya se sabe que el sospechoso es el RAG o el LLM, no el MCP.
 - **La consulta al retriever se arma desde la especificación, no es una pregunta fija.** Así cada ejecución busca lo relevante a ESE requerimiento puntual, en vez de traer siempre el mismo fragmento genérico de las guías.
 - **`fuentes_consultadas` se recalcula después del LLM, no se le pide "de memoria".** Decisión explicada arriba: la fuente de verdad de qué contexto entró es el retriever, no lo que el LLM decida recordar.
-- **`_build_llm()` se duplicó desde `product_agent.py` en su momento, en vez de extraerse a un módulo común.** Con este segundo agente solo existía una segunda necesidad real de un cliente LLM; extraerlo antes habría sido tocar `product_agent.py` sin necesidad y construir infraestructura especulativa antes de que la pidiera un tercer caso de uso. Ese tercer caso de uso llegó con `security_agent.py` (agente 3/6): ahí es donde la duplicación se resolvió, extrayendo `agents/llm_factory.py` y migrando tanto `product_agent.py` como este archivo a importar `build_llm()` desde ahí.
+- **`_build_llm()` se duplicó desde `product_agent.py` en su momento, en vez de extraerse a un módulo común.** Con este segundo agente solo existía una segunda necesidad real de un cliente LLM; extraerlo antes habría sido tocar `product_agent.py` sin necesidad y construir infraestructura especulativa antes de que la pidiera un tercer caso de uso. Ese tercer caso de uso llegó con `security_agent.py` (agente 3/6): ahí es donde la duplicación se resolvió, extrayendo `agents/llm_factory.py` (ver la sección dedicada más arriba, que documenta cómo evolucionó después a un fallback de 4 proveedores más `invoke_structured()`) y migrando tanto `product_agent.py` como este archivo.
 - **`temperature=0` y `method="function_calling"`**: mismas razones que el Product Agent — salida determinista para un documento técnico, y compatibilidad con un modelo gratuito de OpenRouter más tolerante a ese modo que al JSON-schema estricto.
 - **`@observe(name="architect_agent")`**: cada corrida queda trazada en Langfuse — incluyendo, vía el LLM call interno, qué contexto RAG se le pasó al modelo. Eso permite depurar no solo "qué respondió el LLM" sino también "qué le dieron para leer".
 
@@ -254,7 +275,7 @@ Mismo patrón que los dos agentes anteriores: un **update parcial** del estado c
 - **RAG de seguridad sí, MCP todavía no.** Según la tabla de la Fase 6 (`Guia_Construccion.md`), este agente introduce una única dependencia nueva a la vez — el retriever de seguridad — y explícitamente no necesita MCP para este análisis: audita una propuesta de diseño (texto estructurado en el estado), no archivos reales del repo. El MCP entra recién con el Developer Agent (agente 4/6), que sí lee/escribe código.
 - **`riesgos_aceptados` como campo separado de `hallazgos`.** Decisión explicada arriba: sin un lugar correcto para "esto está fuera de alcance a propósito", el LLM contamina el informe con hallazgos que no son accionables para nadie (ya se decidió no resolverlos en esta versión).
 - **`aprobado` se calcula en Python después del LLM, nunca se le pide "de memoria" al modelo.** Mismo principio que `fuentes_consultadas` en `architect_agent.py`: la fuente de verdad de si el diseño pasa o no es la lista de hallazgos que el propio LLM ya escribió, contada de forma determinista — no una casilla adicional que el modelo podría marcar de forma inconsistente con su propia lista.
-- **`agents/llm_factory.py` nace con este agente.** `product_agent.py` y `architect_agent.py` documentaban explícitamente que duplicar `_build_llm()` era aceptable solo "hasta que un tercer caso de uso lo pidiera" — ese tercer caso de uso es `security_agent.py`. Ambos agentes anteriores se migraron para importar `build_llm()` desde el factory común en vez de seguir duplicando la función.
+- **`agents/llm_factory.py` nace con este agente.** `product_agent.py` y `architect_agent.py` documentaban explícitamente que duplicar `_build_llm()` era aceptable solo "hasta que un tercer caso de uso lo pidiera" — ese tercer caso de uso es `security_agent.py`. Ambos agentes anteriores se migraron para importar el factory común en vez de seguir duplicando la función. Con el tiempo (todavía dentro de esta misma etapa del proyecto) esa factory creció a un fallback de 4 proveedores y a `invoke_structured()` — ver la sección dedicada a `agents/llm_factory.py` más arriba; este agente ya usa `invoke_structured(SecurityReview, [...])` en vez de `build_llm().with_structured_output(...)` directo.
 - **`temperature=0` y `method="function_calling"`**: mismas razones que los agentes anteriores — salida determinista para un informe técnico, compatibilidad con el modelo gratuito de OpenRouter.
 - **`@observe(name="security_agent")`**: cada corrida queda trazada en Langfuse, incluyendo qué contexto de `knowledge/security/` se le pasó al modelo — útil para auditar no solo el veredicto sino también qué política concreta lo sustenta.
 
@@ -348,11 +369,12 @@ No existe todavía una tool `get_diff` en `mcp_server/server.py` (su docstring d
 **7. Solo le pide criterio al LLM para la parte que sí lo requiere**
 
 ```python
-structured_llm = build_llm().with_structured_output(ImplementationSummary, method="function_calling")
-summary = structured_llm.invoke(messages + [HumanMessage(content=_SUMMARY_PROMPT)])
+summary = invoke_structured(
+    ImplementationSummary, messages + [HumanMessage(content=_SUMMARY_PROMPT)]
+)
 ```
 
-`ImplementationSummary` (structured output, en una llamada aparte DESPUÉS de cerrar el ciclo de tools) solo tiene dos campos: `resumen` y `notas` (desviaciones del plan, limitaciones, seguimientos sugeridos). Es la única parte del reporte que es opinión, no un hecho verificable — todo lo demás (`archivos_creados`, `archivos_modificados`, `diff`, `pasos_seguidos`) ya se calculó en el paso anterior y se copia tal cual al dict final.
+`invoke_structured()` (no `build_llm().with_structured_output(...)` directo — ver la sección dedicada a `agents/llm_factory.py` más arriba) se usa acá porque esta llamada de resumen SÍ es independiente del ciclo de tools que la precedió: a diferencia del `bind_tools()` de más arriba (que necesita el mismo cliente durante todo el ciclo ReAct), acá no hay problema en que el fallback pruebe un proveedor distinto si hace falta. `ImplementationSummary` (structured output, en una llamada aparte DESPUÉS de cerrar el ciclo de tools) solo tiene dos campos: `resumen` y `notas` (desviaciones del plan, limitaciones, seguimientos sugeridos). Es la única parte del reporte que es opinión, no un hecho verificable — todo lo demás (`archivos_creados`, `archivos_modificados`, `diff`, `pasos_seguidos`) ya se calculó en el paso anterior y se copia tal cual al dict final.
 
 **8. Entrega solo su parte del expediente**
 
@@ -482,7 +504,7 @@ Cada llamada real y exitosa a `run_tests` que el LLM ejecutó se captura (`json.
 
 **7. Solo le pide criterio al LLM para la parte que sí lo requiere**
 
-`TestingSummary` (structured output, en una llamada aparte después del ciclo): `resumen`, `casos_generados` (tests nuevos que agregó, si hubo), `hallazgos` (criterios sin cobertura, fallos relevantes) y `notas`. Todo lo numérico/verificable (`passed`/`failed`/`skipped`/`total`/`aprobado`, `archivos_creados`, `archivos_modificados`, `pasos_seguidos`, `comandos_ejecutados`) se calcula en Python y se copia tal cual al `test_results` final.
+`TestingSummary` (vía `invoke_structured()` — ver la sección dedicada a `agents/llm_factory.py` más arriba —, en una llamada aparte después del ciclo, igual que `ImplementationSummary` en el Developer Agent): `resumen`, `casos_generados` (tests nuevos que agregó, si hubo), `hallazgos` (criterios sin cobertura, fallos relevantes) y `notas`. Todo lo numérico/verificable (`passed`/`failed`/`skipped`/`total`/`aprobado`, `archivos_creados`, `archivos_modificados`, `pasos_seguidos`, `comandos_ejecutados`) se calcula en Python y se copia tal cual al `test_results` final.
 
 ### Cómo se prueba (el bloque `if __name__ == "__main__":`)
 
@@ -514,7 +536,14 @@ Todos se leen con `state.get(...)`, salvo `implementation`, que es la única que
 
 **2. Le pide al LLM un veredicto con motivos y feedback accionable**
 
-`_SYSTEM_PROMPT` le da al LLM el rol de tech lead: evaluar el expediente completo (no un solo aspecto), ser exigente pero justo, y — el punto más importante — dirigir el `feedback` específicamente al agente que tiene que corregirlo, no "al equipo" en general. `ReviewVerdict` es el formulario:
+```python
+verdict = invoke_structured(
+    ReviewVerdict,
+    [SystemMessage(content=_SYSTEM_PROMPT), HumanMessage(content=mensaje_usuario)],
+)
+```
+
+Igual que Product/Architect/Security, usa `invoke_structured()` (ver la sección dedicada a `agents/llm_factory.py` más arriba) — no `build_llm().with_structured_output(...)` directo. `_SYSTEM_PROMPT` le da al LLM el rol de tech lead: evaluar el expediente completo (no un solo aspecto), ser exigente pero justo, y — el punto más importante — dirigir el `feedback` específicamente al agente que tiene que corregirlo, no "al equipo" en general. `ReviewVerdict` es el formulario:
 
 | Campo | Qué captura | Analogía |
 |---|---|---|
@@ -570,4 +599,6 @@ Al correrse directamente (`python agents/reviewer_agent.py`), corre DOS escenari
 
 ## Los 6 agentes, completos
 
-Con `reviewer_agent.py` se cierra la Fase 6 de `Guia_Construccion.md`: los seis agentes (`product_agent`, `architect_agent`, `security_agent`, `developer_agent`, `testing_agent`, `reviewer_agent`) existen y fueron probados de forma aislada, cada uno agregando una sola dependencia nueva a la vez (LLM solo → RAG → RAG de otro dominio → MCP → MCP + nueva tool → nada nuevo, solo evaluación). El siguiente paso es la Fase 7: `graph/nodes.py` (envolver cada función de agente como nodo de LangGraph), `graph/workflow.py` (el camino feliz, sin ciclos: Product → Architect → Developer → Security → Testing → Reviewer → END) y, recién cuando eso funcione, `graph/edges.py` (la conditional edge que usa `review["return_to"]` para volver atrás cuando el veredicto es `REJECTED`, con el límite `MAX_ITERATIONS`).
+Con `reviewer_agent.py` se cierra la Fase 6 de `Guia_Construccion.md`: los seis agentes (`product_agent`, `architect_agent`, `security_agent`, `developer_agent`, `testing_agent`, `reviewer_agent`) existen y fueron probados de forma aislada, cada uno agregando una sola dependencia nueva a la vez (LLM solo → RAG → RAG de otro dominio → MCP → MCP + nueva tool → nada nuevo, solo evaluación).
+
+**Actualización — el proyecto completo ya está terminado.** Las Fases 7-10 de `Guia_Construccion.md` se cerraron después de que se escribió esta sección: `graph/nodes.py`, `graph/edges.py` y `graph/workflow.py` (Fase 7, documentados en `graph/GRAPH.md` con la misma analogía del estudio, extendida a "el gerente de proyecto que coordina la fila de producción"); `tests/` en 3 capas — unitarios mockeados, estructurales del grafo, y 5 escenarios end-to-end reales (Fase 8); `app.py` como CLI vía `argparse` (Fase 9); y `README.md` reescrito con el estado real del proyecto (Fase 10). El límite diario gratuito de OpenRouter que bloqueó varios smoke tests durante la construcción de este documento (ver las notas de validación de Testing y Reviewer más arriba) se resolvió con el fallback de 4 proveedores de `agents/llm_factory.py` documentado al principio de este archivo — ya no depende de un solo proveedor gratuito.
