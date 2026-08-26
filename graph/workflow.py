@@ -113,7 +113,6 @@ def default_invoke_config() -> dict:
     return {"callbacks": [get_callback_handler()]}
 
 
-
 graph_app = build_graph()
 
 if __name__ == "__main__":
