@@ -115,9 +115,6 @@ def default_invoke_config() -> dict:
 
 graph_app = build_graph()
 
-
-
-
 if __name__ == "__main__":
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
