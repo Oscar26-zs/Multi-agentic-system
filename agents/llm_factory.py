@@ -50,14 +50,28 @@ Decisiones:
       architect_agent, security_agent, reviewer_agent, y el resumen final de
       developer_agent/testing_agent) deben usar esta función en vez de
       build_llm().with_structured_output(...).invoke(...) directo.
+    - Reintento corto (2 intentos) por proveedor antes de pasar al siguiente,
+      SOLO si el error es reintentable: nace de un 504 real de NVIDIA en
+      producción (gateway compartido gratuito + modelo de 30B + salida
+      estructurada larga = más chance de timeout puntual). Un 504/5xx/error de
+      red suele ser transitorio — abandonar el proveedor al primer fallo
+      descarta de más un proveedor gratuito ya afinado en los prompts
+      (method="function_calling") por una demora de un instante. Un 4xx (401
+      key inválida, 404 modelo no existe, 400 request mal formada) NUNCA se
+      reintenta: no se va a arreglar solo, y esperar ahí solo demora llegar al
+      siguiente proveedor.
 """
 
 import os
+import time
 
 from langchain_core.messages import HumanMessage
 from langchain_openai import ChatOpenAI
 
 __all__ = ["build_llm", "invoke_structured"]
+
+_MAX_INTENTOS_POR_PROVEEDOR = 2  # intento original + 1 reintento
+_RETRY_DELAY_SECONDS = 2.0
 
 _PROVEEDORES = [
     {
@@ -89,11 +103,26 @@ _PROVEEDORES = [
 ]
 
 
+def _es_reintentable(error: Exception) -> bool:
+    """True si vale la pena reintentar el MISMO proveedor: 5xx/timeout/red.
+
+    False para errores 4xx (401 key inválida, 404 modelo no existe, 400
+    request mal formada) — esos no se arreglan reintentando, hay que pasar
+    al siguiente proveedor de inmediato.
+    """
+    status_code = getattr(error, "status_code", None)
+    if status_code is None:
+        return True  # error de red/timeout sin respuesta HTTP: vale la pena reintentar
+    return status_code >= 500
+
+
 def _probar_proveedor(proveedor: dict, temperature: float) -> ChatOpenAI | None:
     """Construye el cliente de un proveedor y lo valida con un ping barato.
 
+    Reintenta una vez si el error es transitorio (ver _es_reintentable).
     Devuelve None (sin lanzar excepción) si la key falta o el proveedor no
-    responde, para que build_llm() pueda seguir con el siguiente de la lista.
+    responde tras los reintentos, para que build_llm() siga con el siguiente
+    de la lista.
     """
     api_key = os.getenv(proveedor["api_key_env"])
     if not api_key:
@@ -105,17 +134,26 @@ def _probar_proveedor(proveedor: dict, temperature: float) -> ChatOpenAI | None:
         api_key=api_key,
         temperature=temperature,
     )
-    try:
-        llm.invoke([HumanMessage(content="ping")])
-    except Exception as error:
-        print(
-            f"   ALERTA - {proveedor['nombre']} no respondió ({error}); "
-            "probando el siguiente proveedor..."
-        )
-        return None
-
-    print(f"   OK - usando {proveedor['nombre']} (modelo: {proveedor['model']}).")
-    return llm
+    for intento in range(1, _MAX_INTENTOS_POR_PROVEEDOR + 1):
+        try:
+            llm.invoke([HumanMessage(content="ping")])
+        except Exception as error:
+            if intento < _MAX_INTENTOS_POR_PROVEEDOR and _es_reintentable(error):
+                print(
+                    f"   REINTENTANDO - {proveedor['nombre']} (intento {intento + 1}/"
+                    f"{_MAX_INTENTOS_POR_PROVEEDOR}, error reintentable: {error})..."
+                )
+                time.sleep(_RETRY_DELAY_SECONDS)
+                continue
+            print(
+                f"   ALERTA - {proveedor['nombre']} no respondió ({error}); "
+                "probando el siguiente proveedor..."
+            )
+            return None
+        else:
+            print(f"   OK - usando {proveedor['nombre']} (modelo: {proveedor['model']}).")
+            return llm
+    return None
 
 
 def build_llm(temperature: float = 0) -> ChatOpenAI:
@@ -167,14 +205,31 @@ def invoke_structured(schema, messages: list, method: str = "function_calling", 
             api_key=api_key,
             temperature=temperature,
         )
-        try:
-            resultado = llm.with_structured_output(schema, method=method).invoke(messages)
-        except Exception as error:
+
+        resultado = None
+        error_final: Exception | None = None
+        for intento in range(1, _MAX_INTENTOS_POR_PROVEEDOR + 1):
+            try:
+                resultado = llm.with_structured_output(schema, method=method).invoke(messages)
+                error_final = None
+                break
+            except Exception as error:
+                error_final = error
+                if intento < _MAX_INTENTOS_POR_PROVEEDOR and _es_reintentable(error):
+                    print(
+                        f"   REINTENTANDO - {proveedor['nombre']} (intento {intento + 1}/"
+                        f"{_MAX_INTENTOS_POR_PROVEEDOR}, error reintentable: {error})..."
+                    )
+                    time.sleep(_RETRY_DELAY_SECONDS)
+                    continue
+                break
+
+        if error_final is not None:
             print(
                 f"   ALERTA - {proveedor['nombre']} lanzó un error generando salida "
-                f"estructurada ({error}); probando el siguiente proveedor..."
+                f"estructurada ({error_final}); probando el siguiente proveedor..."
             )
-            errores.append(f"{proveedor['nombre']}: {error}")
+            errores.append(f"{proveedor['nombre']}: {error_final}")
             continue
 
         if resultado is None:
