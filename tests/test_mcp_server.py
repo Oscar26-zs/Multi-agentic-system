@@ -22,6 +22,7 @@ EXPECTED_TOOLS = [
     "create_file",
     "list_files",
     "read_file",
+    "run_tests",
     "search_code",
     "update_file",
 ]
@@ -210,3 +211,25 @@ def test_update_file_falla_si_fragmento_ambiguo(scratch):
 def test_tools_escritura_rechazan_rutas_fuera_del_repo():
     with pytest.raises(ValueError, match="escapa del repositorio"):
         server.update_file("../.env", "x", "y")
+
+
+# ---------- Tool de ejecución (run_tests) ----------
+
+
+def test_run_tests_subpath_inexistente_lanza_error_claro():
+    with pytest.raises(FileNotFoundError, match="no existe"):
+        server.run_tests("carpeta_inventada_para_tests")
+
+
+def test_run_tests_rechaza_escape_del_sandbox():
+    with pytest.raises(ValueError, match="escapa del repositorio"):
+        server.run_tests("../fuera_del_repo")
+
+
+def test_run_tests_parsea_lineas_de_resumen_de_dotnet_test():
+    salida = (
+        "Passed!  - Failed:     0, Passed:     3, Skipped:     0, Total:     3, Duration: 10 ms - A.dll\n"
+        "Failed!  - Failed:     1, Passed:     2, Skipped:     1, Total:     4, Duration: 20 ms - B.dll\n"
+    )
+    matches = server._DOTNET_TEST_SUMMARY_RE.findall(salida)
+    assert matches == [("0", "3", "0", "3"), ("1", "2", "1", "4")]
