@@ -237,10 +237,16 @@ if __name__ == "__main__":
 
     print("2. Armando un estado con specification + architecture de prueba "
           "(simulando al Product y Architect Agent)...")
-    state = create_initial_state(
+    requerimiento_ejemplo = sys.argv[1] if len(sys.argv) > 1 else (
         "Como empleado quiero poder solicitar vacaciones indicando fecha de inicio "
         "y fin, y que mi jefe directo apruebe o rechace la solicitud."
     )
+    state = create_initial_state(requerimiento_ejemplo)
+    if len(sys.argv) > 1:
+        print(
+            "   (nota: requirement personalizado; specification/architecture de prueba "
+            "de abajo siguen siendo las del ejemplo de vacaciones, no se derivan de tu texto)"
+        )
     state["specification"] = {
         "resumen": "Flujo de solicitud y aprobación de vacaciones entre empleado y jefe directo.",
         "actores": ["Empleado", "Aprobador", "RRHH"],

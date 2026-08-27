@@ -148,11 +148,11 @@ if __name__ == "__main__":
         )
     print("   OK - variable presente.")
 
-    requerimiento_ejemplo = (
+    requerimiento_ejemplo = sys.argv[1] if len(sys.argv) > 1 else (
         "Como empleado quiero poder solicitar vacaciones indicando fecha de inicio "
         "y fin, y que mi jefe directo apruebe o rechace la solicitud."
     )
-    print(f"2. Construyendo estado inicial con requerimiento de ejemplo:\n   {requerimiento_ejemplo!r}")
+    print(f"2. Construyendo estado inicial con requerimiento{' personalizado' if len(sys.argv) > 1 else ' de ejemplo'}:\n   {requerimiento_ejemplo!r}")
     state = create_initial_state(requerimiento_ejemplo)
 
     print("3. Invocando product_agent (llamada real al LLM vía OpenRouter)...")

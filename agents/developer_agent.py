@@ -67,6 +67,34 @@ Decisiones (Fase 6 de Guia_Construccion.md, agente 4/6):
       ver su docstring: "run_tests y get_diff se agregarán después").
     - Cliente LLM vía agents/llm_factory.py (build_llm), igual que los tres
       agentes anteriores.
+    - print() por turno y por tool call dentro del ciclo ReAct: corriendo
+      vía app.py (streaming por nodo), la terminal quedaba en silencio total
+      durante los ~12 turnos posibles de este agente — parecía "trabado" sin
+      forma de saber si seguía vivo. Con esto se ve cada consulta al LLM y
+      cada tool call en tiempo real, no solo el resultado final del nodo.
+    - asyncio.to_thread() + invoke_with_retry() (agents/mcp_tools.py) en la
+      llamada al LLM del ciclo: en producción se vio "unhandled errors in a
+      TaskGroup" en distintos turnos de corridas reales. Se descartó
+      experimentalmente que fuera un problema de bloqueo del event loop (un
+      script de prueba con time.sleep de hasta 90s vía asyncio.to_thread,
+      intercalado con llamadas MCP reales, no rompió nada) y se confirmó la
+      causa real en Langfuse: un 429 (rate limit de tokens/minuto de Groq)
+      crudo, sin manejar — este LLM se bindea una sola vez al principio del
+      ciclo (bind_tools) y, a diferencia de invoke_structured(), no tenía
+      ningún reintento propio. invoke_with_retry() reintenta ante 429 sobre
+      el MISMO cliente (nunca cambia de proveedor a mitad de conversación,
+      rompería el formato de tool calls ya establecido).
+    - El try/except alrededor de esa llamada, dentro del loop: 429 no fue el
+      único error real visto en producción — también un 413 ("Request too
+      large", historial acumulado superando el límite de tokens/minuto del
+      proveedor) y un 400 (el modelo alucinó una tool, "print_tree", que
+      nunca se le ofreció). Ninguno de los dos es recuperable reintentando.
+      En vez de seguir agregando casos especiales uno por uno, cualquier
+      error que invoke_with_retry no resuelva corta el ciclo ahí mismo — el
+      mismo tratamiento que ya tenía agotar MAX_TOOL_ITERATIONS: se sigue al
+      resumen final con el progreso real hecho hasta ese turno, en vez de
+      tumbar developer_agent (y con él, todo el pipeline) por un error del
+      LLM que no tiene nada que ver con si el trabajo ya hecho es válido.
 """
 
 import asyncio
@@ -90,6 +118,7 @@ if __package__ in (None, ""):
 from agents.llm_factory import build_llm, invoke_structured
 from agents.mcp_tools import (
     REPO_ROOT,
+    invoke_with_retry,
     mcp_server_params,
     result_text,
     summarize_args,
@@ -104,8 +133,15 @@ load_dotenv()
 
 __all__ = ["ImplementationSummary", "developer_agent"]
 
-MAX_TOOL_ITERATIONS = 12
-_TOOL_RESULT_CHAR_LIMIT = 4000
+MAX_TOOL_ITERATIONS = 8  # bajado de 12: cada turno es una llamada LLM real, y para
+# los escenarios que pide la consigna del proyecto (explorar 2-3 archivos existentes
+# + crear/editar 3-5 archivos nuevos, ej. Password Recovery, Account Locking) alcanza
+# de sobra; 12 dejaba margen mayor al necesario y multiplicaba el costo del peor caso.
+_TOOL_RESULT_CHAR_LIMIT = 1500  # bajado de 4000: cada resultado de tool queda en el
+# historial y se reenvía COMPLETO en cada turno siguiente — con 4000 chars por
+# resultado (list_files por sí solo ya devuelve ~4000+), para el turno 6 la petición
+# superaba el límite de 8000 tokens/minuto de Groq (413 "Request too large"), sin
+# que reintentar sirviera de nada (no es un 429, la petición nunca iba a entrar).
 
 _SYSTEM_PROMPT = """\
 Eres un ingeniero de software senior de un estudio de ingeniería. Recibes la
@@ -114,6 +150,14 @@ decisiones técnicas, plan de alto nivel) más fragmentos reales de las guías
 internas de desarrollo del equipo (estándares de código y clean code). Tu
 trabajo es EJECUTAR ese plan sobre el repositorio real, usando exclusivamente
 las tools disponibles — nunca describas cambios sin aplicarlos.
+
+Las ÚNICAS tools que existen son: list_files, read_file, search_code,
+create_file, update_file. No existe ninguna otra herramienta bajo ningún
+nombre (ej. NO existe "print_tree", "get_tree", "show_structure" ni ninguna
+variante para "ver el árbol de carpetas") — si necesitás la estructura del
+repositorio, list_files() ya te la devuelve completa y recursiva en un solo
+llamado. Si intentás llamar una tool que no está en esta lista exacta, la
+llamada falla y perdés el turno.
 
 Instrucciones:
 - Antes de crear o editar nada, explora el repositorio real con list_files,
@@ -208,12 +252,36 @@ async def _run_tool_loop(mensaje_usuario: str) -> tuple[list, list[str], list[st
             diffs: dict = {}
             pasos: list[str] = []
 
-            for _ in range(MAX_TOOL_ITERATIONS):
-                ai_message = llm_with_tools.invoke(messages)
+            for turno in range(1, MAX_TOOL_ITERATIONS + 1):
+                print(f"      [Developer Agent] turno {turno}/{MAX_TOOL_ITERATIONS}: consultando al LLM...")
+                # asyncio.to_thread: libera el event loop mientras el LLM responde, para
+                # que anyio/MCP puedan seguir sirviendo el subproceso en paralelo.
+                # invoke_with_retry (agents/mcp_tools.py): reintenta ante 429 (rate limit)
+                # sobre el MISMO cliente — la causa real confirmada de "unhandled errors in
+                # a TaskGroup": este LLM se bindea una sola vez al principio del ciclo (ver
+                # decisión abajo) y, a diferencia de invoke_structured(), no tenía ningún
+                # reintento propio — un 429 crudo del proveedor reventaba sin manejo.
+                try:
+                    ai_message = await asyncio.to_thread(invoke_with_retry, llm_with_tools, messages)
+                except Exception as error:
+                    # Cualquier error del LLM que invoke_with_retry no pudo resolver
+                    # (ya sea porque no es un 429, o porque el 429 persistió tras los
+                    # reintentos) NO debe tumbar todo el pipeline — se corta el ciclo
+                    # acá mismo, igual que cuando se agota MAX_TOOL_ITERATIONS, y se
+                    # sigue al resumen final con lo que se alcanzó a hacer. Visto en
+                    # producción: 429 (rate limit), 413 (petición muy grande), 400
+                    # (el modelo alucinó una tool que no existe) — la causa cambia,
+                    # pero ninguna amerita perder el progreso ya hecho.
+                    print(f"      [Developer Agent] ALERTA - error irrecuperable del LLM en el turno {turno}, cortando el ciclo: {error}")
+                    pasos.append(f"⚠ el ciclo se cortó en el turno {turno} por un error del LLM: {error}")
+                    break
                 messages.append(ai_message)
                 if not ai_message.tool_calls:
+                    print("      [Developer Agent] el modelo no pidió más tools; ciclo terminado.")
                     break
                 for tool_call in ai_message.tool_calls:
+                    args_resumen = summarize_args(tool_call.get("args", {}))
+                    print(f"      [Developer Agent] -> {tool_call['name']}({args_resumen})")
                     result = await session.call_tool(
                         tool_call["name"], tool_call.get("args", {})
                     )
@@ -225,6 +293,7 @@ async def _run_tool_loop(mensaje_usuario: str) -> tuple[list, list[str], list[st
                         diffs[file_path] = diff
                         (archivos_creados if bucket == "creado" else archivos_modificados).add(file_path)
                     estado = "ERROR" if is_error else "OK"
+                    print(f"      [Developer Agent]    {estado}")
                     pasos.append(
                         f"{tool_call['name']}({summarize_args(tool_call.get('args', {}))}) -> {estado}"
                     )
@@ -330,10 +399,16 @@ if __name__ == "__main__":
     print(f"   OK - {repo_target!r} existe.")
 
     print("3. Armando un estado con architecture de prueba (simulando al Architect Agent)...")
-    state = create_initial_state(
+    requerimiento_ejemplo = sys.argv[1] if len(sys.argv) > 1 else (
         "Como empleado quiero poder solicitar vacaciones indicando fecha de inicio "
         "y fin, y que mi jefe directo apruebe o rechace la solicitud."
     )
+    state = create_initial_state(requerimiento_ejemplo)
+    if len(sys.argv) > 1:
+        print(
+            "   (nota: requirement personalizado; la architecture de prueba de abajo "
+            "sigue siendo la del ejemplo de vacaciones, no se deriva de tu texto)"
+        )
     state["specification"] = {
         "resumen": "Flujo de solicitud y aprobación de vacaciones entre empleado y aprobador.",
         "actores": ["Empleado", "Aprobador"],

@@ -21,15 +21,16 @@ Decisiones:
       dos agentes anteriores (salida determinista para documentos técnicos),
       pero queda parametrizable por si un agente futuro necesita más
       variabilidad (ej. redacción de mensajes al usuario).
-    - Fallback multi-proveedor (OpenRouter -> NVIDIA NIM -> Groq -> Google AI
+    - Fallback multi-proveedor (Groq -> NVIDIA NIM -> OpenRouter -> Google AI
       Studio): los modelos gratuitos tienen cuotas compartidas impredecibles;
       si uno falla (rate limit, modelo caído, key inválida, timeout),
-      build_llm() prueba el siguiente en vez de tumbar el agente. Orden
-      reordenado tras uso real: NVIDIA empezó primero (hostea directamente el
-      modelo nemotron para el que están afinados los prompts,
-      method="function_calling"), pero en la práctica quedó dando timeout de
-      forma repetida mientras OpenRouter respondía rápido y confiable — se
-      movió OpenRouter al frente por eso, no por diseño original.
+      build_llm() prueba el siguiente en vez de tumbar el agente. Groq va
+      primero por disponibilidad real observada: NVIDIA empezó primero
+      (hostea directamente el modelo nemotron para el que están afinados los
+      prompts), pero en la práctica quedó devolviendo 404 en cascada (caída
+      del lado de NVIDIA) y arrastrando a OpenRouter con el mismo error —
+      Groq fue el único proveedor que siguió respondiendo. Si esto se
+      revierte, el orden es lo primero a ajustar.
     - La selección se hace UNA SOLA VEZ por llamada a build_llm(), no por
       cada turno de una conversación: developer_agent.py y testing_agent.py
       hacen bind_tools() sobre el resultado y lo reusan durante todo su ciclo
@@ -88,10 +89,10 @@ _REQUEST_TIMEOUT_SECONDS = 600.0  # cota dura por intento (10 min): evita cuelgu
 
 _PROVEEDORES = [
     {
-        "nombre": "OpenRouter",
-        "api_key_env": "OPENROUTER_API_KEY",
-        "base_url": os.getenv("LLM_BASE_URL", "https://openrouter.ai/api/v1"),
-        "model": os.getenv("LLM_MODEL_NAME", "nvidia/nemotron-3.5-lightning:free"),
+        "nombre": "Groq",
+        "api_key_env": "GROQ_API_KEY",
+        "base_url": os.getenv("GROQ_BASE_URL", "https://api.groq.com/openai/v1"),
+        "model": os.getenv("GROQ_MODEL_NAME", "openai/gpt-oss-120b"),
     },
     {
         "nombre": "NVIDIA NIM",
@@ -100,10 +101,10 @@ _PROVEEDORES = [
         "model": os.getenv("NVIDIA_MODEL_NAME", "nvidia/nemotron-3.5-lightning-30b-a3b"),
     },
     {
-        "nombre": "Groq",
-        "api_key_env": "GROQ_API_KEY",
-        "base_url": os.getenv("GROQ_BASE_URL", "https://api.groq.com/openai/v1"),
-        "model": os.getenv("GROQ_MODEL_NAME", "openai/gpt-oss-120b"),
+        "nombre": "OpenRouter",
+        "api_key_env": "OPENROUTER_API_KEY",
+        "base_url": os.getenv("LLM_BASE_URL", "https://openrouter.ai/api/v1"),
+        "model": os.getenv("LLM_MODEL_NAME", "nvidia/nemotron-3.5-lightning:free"),
     },
     {
         "nombre": "Google AI Studio",
@@ -173,7 +174,7 @@ def _probar_proveedor(proveedor: dict, temperature: float) -> ChatOpenAI | None:
 def build_llm(temperature: float = 0) -> ChatOpenAI:
     """Construye el cliente LLM probando proveedores en orden hasta que uno responda.
 
-    Orden: OpenRouter -> NVIDIA NIM -> Groq -> Google AI Studio.
+    Orden: Groq -> NVIDIA NIM -> OpenRouter -> Google AI Studio.
     """
     for proveedor in _PROVEEDORES:
         llm = _probar_proveedor(proveedor, temperature)

@@ -4,23 +4,24 @@ Sistema multiagente que simula un equipo de desarrollo de software autónomo (pr
 
 ## Estado del proyecto
 
-Las 10 fases de `Guia_Construccion.md` están completas: los 6 agentes funcionan con LLM real, el grafo corre el camino feliz y el ciclo de revisión, hay tres capas de tests (unitarios mockeados, estructurales del grafo, y escenarios end-to-end reales), y `app.py` expone todo por CLI. Ver [`agents/AGENTS.md`](agents/AGENTS.md) (cómo funciona cada agente, con analogías) y [`tests/TESTS.md`](tests/TESTS.md) (estrategia de pruebas) para el detalle.
+Las 10 fases de `Guia_Construccion.md` están completas: los 6 agentes funcionan con LLM real, el grafo corre el camino feliz, el ciclo de revisión y un gate de Human-in-the-Loop antes de tocar el repo real, hay tres capas de tests (unitarios mockeados, estructurales del grafo, y escenarios end-to-end reales), y `app.py` expone todo por CLI con progreso en vivo. Ver [`agents/AGENTS.md`](agents/AGENTS.md) (cómo funciona cada agente, con analogías), [`tests/TESTS.md`](tests/TESTS.md) (estrategia de pruebas) y [`graph/HUMAN_IN_THE_LOOP.md`](graph/HUMAN_IN_THE_LOOP.md) (el gate de aprobación humana) para el detalle.
 
 ## Arquitectura
 
 Flujo principal del grafo (`graph/workflow.py`):
 
 ```
-Product Agent → Architect Agent → Developer Agent → Security Agent → Testing Agent → Reviewer Agent
-                                                                                            │
-                                                                          APPROVED ─────────┤──→ END
-                                                                          REJECTED ─────────┘
-                                                                          (vuelve a return_to,
-                                                                           hasta MAX_ITERATIONS=3,
-                                                                           luego escala a humano)
+Product Agent → Architect Agent → [Aprobación humana] → Developer Agent → Security Agent → Testing Agent → Reviewer Agent
+                                          │                                                                       │
+                                    RECHAZADO                                                     APPROVED ───────┤──→ END
+                                          │                                                        REJECTED ──────┘
+                                          ▼                                            (vuelve a return_to,
+                                        END (CANCELLED)                                 hasta MAX_ITERATIONS=3,
+                                                                                         luego escala a humano)
 ```
 
-- **Estado compartido:** `EngineeringState` (`graph/state.py`) — un diccionario que viaja por todos los nodos; cada agente lee lo que dejaron los anteriores y escribe solo su parte (`specification`, `architecture`, `implementation`, `security_review`, `test_results`, `review`).
+- **Estado compartido:** `EngineeringState` (`graph/state.py`) — un diccionario que viaja por todos los nodos; cada agente lee lo que dejaron los anteriores y escribe solo su parte (`specification`, `architecture`, `implementation`, `security_review`, `test_results`, `review`, `plan_approval`).
+- **Human-in-the-Loop antes de tocar el repo real:** entre `architect_agent` y `developer_agent`, `graph/edges.py::request_plan_approval` muestra el plan propuesto y pausa esperando aprobación por teclado — `developer_agent` es el único nodo que escribe archivos reales vía MCP, y no corre sin luz verde humana. Si se rechaza, el pipeline termina con `review.status = "CANCELLED"` sin tocar el repo. Ver `graph/HUMAN_IN_THE_LOOP.md`.
 - **Ciclo de revisión:** el Reviewer emite `APPROVED` (fin) o `REJECTED` con un `return_to` (a qué agente vuelve el trabajo). Dos guardrails deterministas (no dejados al criterio del LLM) fuerzan `REJECTED` si `security_review["aprobado"]` o `test_results["aprobado"]` son `False`, sin importar qué haya dicho el modelo — ver `agents/reviewer_agent.py::_coerce_verdict`.
 - **RAG:** `knowledge/*.md` (arquitectura, seguridad, desarrollo, testing) se ingesta a Chroma (`rag/ingestion.py`) y se expone como retrievers especializados por dominio (`rag/retrievers.py`) — búsquedas locales, sin costo de API.
 - **MCP:** servidor propio (`mcp_server/server.py`) con las tools `list_files`, `read_file`, `search_code`, `create_file`, `update_file`, `run_tests` (corre `dotnet test` real vía subprocess), sandboxeadas a `REPO_TARGET_PATH`. `developer_agent.py` y `testing_agent.py` lo consumen por protocolo real (`stdio_client` + `ClientSession`), no por import directo.
@@ -56,6 +57,7 @@ autonomous-swe-team/
 ├── agents/            # Los 6 agentes + llm_factory.py (fallback multi-proveedor) + mcp_tools.py
 │   └── AGENTS.md       # Cómo funciona cada agente, con analogías
 ├── graph/              # state.py, nodes.py, edges.py, workflow.py (LangGraph)
+│   └── HUMAN_IN_THE_LOOP.md  # El gate de aprobación humana, con analogía
 ├── rag/                # Ingesta, retrievers y vector store (Chroma)
 ├── mcp_server/          # Servidor MCP propio (tools sobre el repo objetivo)
 ├── observability/      # Configuración de Langfuse
@@ -94,7 +96,7 @@ Nunca commitear `.env` (ya está en `.gitignore`).
 .venv\Scripts\python.exe app.py "Como empleado quiero poder solicitar vacaciones indicando fecha de inicio y fin, y que mi jefe directo apruebe o rechace la solicitud."
 ```
 
-Corre el pipeline completo (llamadas reales a LLM/RAG/MCP — tarda varios minutos) e imprime el veredicto final más el expediente de cada etapa. Código de salida: `0` = `APPROVED`, `1` = `REJECTED`, `2` = escalado a revisión humana (`MAX_ITERATIONS` agotado).
+Corre el pipeline completo (llamadas reales a LLM/RAG/MCP — tarda varios minutos), imprimiendo progreso en vivo (qué agente terminó, en qué momento) en vez de esperar en silencio hasta el final. Apenas termina `architect_agent`, **pausa y pide aprobación por teclado** antes de dejar avanzar a `developer_agent` (ver `graph/HUMAN_IN_THE_LOOP.md`). Al final imprime el veredicto y el expediente de cada etapa. Código de salida: `0` = `APPROVED`, `1` = `REJECTED`, `2` = escalado a revisión humana (`MAX_ITERATIONS` agotado), `3` = cancelado por el usuario en el gate de aprobación.
 
 También se puede correr cada agente o cada módulo por separado, de forma aislada (mismo patrón en todos: `if __name__ == "__main__":`):
 
@@ -106,7 +108,7 @@ También se puede correr cada agente o cada módulo por separado, de forma aisla
 ## Pruebas
 
 ```powershell
-.venv\Scripts\python.exe -m pytest tests/          # unitarios + grafo, ~65 tests, sin LLM, segundos
+.venv\Scripts\python.exe -m pytest tests/          # unitarios + grafo, ~70 tests, sin LLM, segundos
 .venv\Scripts\python.exe -m pytest tests/ -m integration   # + 5 escenarios reales de punta a punta (cuesta cuota de API, tarda minutos)
 ```
 

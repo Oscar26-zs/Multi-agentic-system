@@ -47,6 +47,14 @@ Decisiones (Fase 7 de Guia_Construccion.md, paso 2/3 y 4/3):
       cada agente sin tocar agents/ ni nodes.py. Cada agente ya está trazado
       individualmente vía @observe; esto además correlaciona sus llamadas
       LLM bajo la misma corrida en Langfuse.
+    - Human-in-the-Loop entre architect_agent y developer_agent
+      (request_plan_approval, graph/edges.py): developer_agent es el único
+      nodo que escribe sobre el repo real vía MCP, así que el gate se ubica
+      justo antes de esa transición, no en cualquier otro punto de la cadena.
+      route_after_plan_approval decide developer_agent (aprobado) o
+      cancelled_by_human (rechazado); ambos casos quedan registrados con su
+      propio path_map explícito, mismo criterio que ROUTE_PATH_MAP para el
+      ciclo de revisión.
 """
 
 import sys
@@ -60,7 +68,16 @@ if __package__ in (None, ""):
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.state import CompiledStateGraph
 
-from graph.edges import ROUTE_PATH_MAP, MAX_ITERATIONS, advance_iteration, escalate_to_human, route_after_review
+from graph.edges import (
+    MAX_ITERATIONS,
+    ROUTE_PATH_MAP,
+    advance_iteration,
+    cancelled_by_human,
+    escalate_to_human,
+    request_plan_approval,
+    route_after_plan_approval,
+    route_after_review,
+)
 from graph.nodes import (
     architect_agent_node,
     developer_agent_node,
@@ -87,11 +104,19 @@ def build_graph() -> CompiledStateGraph:
     g.add_node("reviewer_agent", reviewer_agent_node)
     g.add_node("advance_iteration", advance_iteration)
     g.add_node("escalate_to_human", escalate_to_human)
+    g.add_node("request_plan_approval", request_plan_approval)
+    g.add_node("cancelled_by_human", cancelled_by_human)
 
-    # Camino feliz: Product -> Architect -> Developer -> Security -> Testing -> Reviewer
+    # Camino feliz: Product -> Architect -> [aprobación humana] -> Developer -> Security -> Testing -> Reviewer
     g.add_edge(START, "product_agent")
     g.add_edge("product_agent", "architect_agent")
-    g.add_edge("architect_agent", "developer_agent")
+    g.add_edge("architect_agent", "request_plan_approval")
+    g.add_conditional_edges(
+        "request_plan_approval",
+        route_after_plan_approval,
+        {"developer_agent": "developer_agent", "cancelled_by_human": "cancelled_by_human"},
+    )
+    g.add_edge("cancelled_by_human", END)
     g.add_edge("developer_agent", "security_agent")
     g.add_edge("security_agent", "testing_agent")
     g.add_edge("testing_agent", "reviewer_agent")
@@ -136,11 +161,22 @@ if __name__ == "__main__":
 
     print("2. Corriendo un requerimiento real de punta a punta por los 6 agentes reales...")
     print("   (LLM + RAG + MCP reales, sin mocks — puede tardar varios minutos).")
+    print("   Incluye el gate de Human-in-the-Loop antes de developer_agent: va a pedir")
+    print("   aprobación por teclado apenas termine architect_agent.\n")
     estado_inicial = create_initial_state(
         "Como empleado quiero poder solicitar vacaciones indicando fecha de inicio "
         "y fin, y que mi jefe directo apruebe o rechace la solicitud."
     )
-    resultado = graph_app.invoke(estado_inicial, config=default_invoke_config())
+
+    resultado = dict(estado_inicial)
+    for evento in graph_app.stream(estado_inicial, config=default_invoke_config(), stream_mode="updates"):
+        for nodo, actualizacion in evento.items():
+            print(f"   >> [{nodo}] completado.")
+            for clave, valor in actualizacion.items():
+                if clave in ("messages", "errors"):
+                    resultado[clave] = resultado.get(clave, []) + valor
+                else:
+                    resultado[clave] = valor
 
     print("3. Verificando que cada etapa del pipeline dejó su parte del estado poblada...")
     campos_esperados = [

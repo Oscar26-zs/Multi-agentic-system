@@ -30,6 +30,11 @@ Decisiones (Fase 8 de Guia_Construccion.md):
       propio módulo en el momento en que se llama, así que parchear el
       atributo del módulo workflow antes de llamar a build_graph() alcanza,
       sin tocar graph/nodes.py ni los agentes reales.
+    - request_plan_approval (graph/edges.py) TAMBIÉN se mockea acá, con un
+      fake parametrizable (aprobar_plan, default True): ese nodo hace un
+      input() real para el gate de Human-in-the-Loop — sin mockearlo, estos
+      tests colgarían la suite esperando teclado. El caso "rechazado" se
+      prueba explícito en test_plan_rechazado_por_humano_cancela_el_pipeline.
     - invoke() se llama SIN config (sin callback handler de Langfuse): estos
       tests no hacen ninguna llamada LLM real, así que no hay nada que trazar
       y evitamos una dependencia de red para un test que debe poder correr
@@ -39,7 +44,14 @@ Decisiones (Fase 8 de Guia_Construccion.md):
 import pytest
 
 import graph.workflow as workflow_mod
-from graph.edges import MAX_ITERATIONS, advance_iteration, escalate_to_human, route_after_review
+from graph.edges import (
+    MAX_ITERATIONS,
+    advance_iteration,
+    cancelled_by_human,
+    escalate_to_human,
+    route_after_plan_approval,
+    route_after_review,
+)
 from graph.state import create_initial_state
 from langgraph.graph import END
 
@@ -76,6 +88,31 @@ def test_route_after_review_rejected_sin_return_to_valido_escala_a_humano():
     assert route_after_review(estado) == "escalate_to_human"
 
 
+# ---------- graph/edges.py: gate de Human-in-the-Loop (segundo punto de HITL) ----------
+
+
+def test_route_after_plan_approval_aprobado_va_a_developer():
+    estado = {"plan_approval": {"approved": True}}
+    assert route_after_plan_approval(estado) == "developer_agent"
+
+
+def test_route_after_plan_approval_rechazado_va_a_cancelled():
+    estado = {"plan_approval": {"approved": False}}
+    assert route_after_plan_approval(estado) == "cancelled_by_human"
+
+
+def test_route_after_plan_approval_sin_campo_va_a_cancelled():
+    """Caso defensivo: sin plan_approval en el estado, no se asume aprobado."""
+    assert route_after_plan_approval({}) == "cancelled_by_human"
+
+
+def test_cancelled_by_human_deja_status_cancelled_y_escala():
+    resultado = cancelled_by_human({})
+    assert resultado["review"]["status"] == "CANCELLED"
+    assert resultado["review"]["return_to"] is None
+    assert resultado["human_review_required"] is True
+
+
 # ---------- graph/workflow.py: ensamblaje completo con nodos fake (sin LLM) ----------
 
 
@@ -102,10 +139,22 @@ def _make_reviewer_fake(reviews: list[dict]):
     return _node
 
 
+def _fake_plan_approval(aprobar: bool):
+    def _node(state):
+        return {
+            "plan_approval": {"approved": aprobar, "note": "fake de test"},
+            "messages": [f"request_plan_approval:{'aprobado' if aprobar else 'rechazado'}"],
+        }
+
+    return _node
+
+
 @pytest.fixture()
 def patched_graph(monkeypatch):
-    """Devuelve (build_fn, reviewer_fake) — build_fn(reviews) arma un grafo
-    fresco con 5 nodos fake fijos + un reviewer fake parametrizable."""
+    """Devuelve build_fn(reviews, aprobar_plan=True) — arma un grafo fresco
+    con 5 nodos fake fijos + un reviewer fake parametrizable + el gate de
+    Human-in-the-Loop mockeado (sin tocar stdin real). Devuelve
+    (grafo, reviewer_fake)."""
 
     monkeypatch.setattr(workflow_mod, "product_agent_node", _fake_node("specification", {"resumen": "spec"}, "product_agent"))
     monkeypatch.setattr(workflow_mod, "architect_agent_node", _fake_node("architecture", {"resumen": "arch"}, "architect_agent"))
@@ -113,9 +162,10 @@ def patched_graph(monkeypatch):
     monkeypatch.setattr(workflow_mod, "security_agent_node", _fake_node("security_review", {"aprobado": True}, "security_agent"))
     monkeypatch.setattr(workflow_mod, "testing_agent_node", _fake_node("test_results", {"aprobado": True}, "testing_agent"))
 
-    def _build(reviews: list[dict]):
+    def _build(reviews: list[dict], aprobar_plan: bool = True):
         reviewer_fake = _make_reviewer_fake(reviews)
         monkeypatch.setattr(workflow_mod, "reviewer_agent_node", reviewer_fake)
+        monkeypatch.setattr(workflow_mod, "request_plan_approval", _fake_plan_approval(aprobar_plan))
         return workflow_mod.build_graph(), reviewer_fake
 
     return _build
@@ -175,3 +225,20 @@ def test_build_graph_valida_que_todos_los_destinos_de_route_existan(patched_grap
     (vía StateGraph.compile()) lanzaría acá, no en tiempo de ejecución."""
     grafo, _ = patched_graph([{"status": "APPROVED", "return_to": None}])
     assert grafo is not None
+
+
+def test_plan_rechazado_por_humano_cancela_el_pipeline(patched_graph):
+    """El gate de Human-in-the-Loop corta ANTES de developer_agent: si el
+    usuario rechaza, el pipeline nunca debería llegar a tocar el repo real."""
+    grafo, reviewer_fake = patched_graph(
+        [{"status": "APPROVED", "return_to": None}], aprobar_plan=False
+    )
+    estado_inicial = create_initial_state(REQUIREMENT)
+
+    resultado = grafo.invoke(estado_inicial)
+
+    assert resultado["review"]["status"] == "CANCELLED"
+    assert resultado["human_review_required"] is True
+    assert resultado["plan_approval"]["approved"] is False
+    assert not resultado.get("implementation"), "developer_agent no debería haber corrido"
+    assert reviewer_fake.llamadas["n"] == 0, "reviewer_agent no debería haber corrido"

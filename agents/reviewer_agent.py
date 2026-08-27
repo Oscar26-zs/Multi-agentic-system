@@ -250,10 +250,16 @@ if __name__ == "__main__":
     print("   OK - variable presente.")
 
     print("2. Armando un estado completo de prueba (simulando a los cinco agentes anteriores)...")
-    state = create_initial_state(
+    requerimiento_ejemplo = sys.argv[1] if len(sys.argv) > 1 else (
         "Como empleado quiero poder solicitar vacaciones indicando fecha de inicio "
         "y fin, y que mi jefe directo apruebe o rechace la solicitud."
     )
+    state = create_initial_state(requerimiento_ejemplo)
+    if len(sys.argv) > 1:
+        print(
+            "   (nota: requirement personalizado; el expediente de prueba de abajo "
+            "sigue siendo el del ejemplo de vacaciones, no se deriva de tu texto)"
+        )
     state["specification"] = {
         "resumen": "Flujo de solicitud y aprobación de vacaciones entre empleado y aprobador.",
         "actores": ["Empleado", "Aprobador"],

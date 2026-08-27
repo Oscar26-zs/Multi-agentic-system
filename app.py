@@ -26,12 +26,23 @@ Decisiones (Fase 9 de Guia_Construccion.md):
       dejar que el traceback crudo de LangGraph/Pydantic llegue al usuario
       final de la CLI.
     - Código de salida distinto según el desenlace (0=APPROVED, 1=REJECTED
-      sin escalar, 2=escalado a humano): permite usar la CLI en un script o
-      pipeline de CI que necesite reaccionar al resultado sin parsear texto.
+      sin escalar, 2=escalado a humano, 3=cancelado por el usuario en el gate
+      de aprobación): permite usar la CLI en un script o pipeline de CI que
+      necesite reaccionar al resultado sin parsear texto.
     - --no-trace es opcional (por defecto SÍ se traza a Langfuse, igual que
       el resto del sistema): existe solo para poder correr la CLI sin
       credenciales de Langfuse configuradas, no porque tracear sea indeseable
       por defecto.
+    - grafo.stream(..., stream_mode="updates") en vez de .invoke(): así se ve
+      progreso en vivo (qué nodo terminó, en qué momento) en vez de esperar
+      en silencio hasta el final. Es también lo que hace visible el gate de
+      Human-in-the-Loop (graph/edges.py::request_plan_approval) — ese nodo
+      hace un input() real, así que al llegar el stream ahí el proceso se
+      pausa en pantalla esperando al usuario, sin lógica extra acá para
+      "manejar" la pausa. El estado final se reconstruye a mano acumulando
+      las actualizaciones de cada nodo: messages/errors se concatenan (mismo
+      reducer operator.add que declara graph/state.py), el resto se
+      sobreescribe (mismo criterio: "gana el último en escribir").
 """
 
 import argparse
@@ -48,6 +59,19 @@ from observability.langfuse_config import flush_traces
 load_dotenv()
 
 __all__ = ["main"]
+
+_NODE_LABELS = {
+    "product_agent": "Product Agent",
+    "architect_agent": "Architect Agent",
+    "request_plan_approval": "Aprobación humana del plan",
+    "cancelled_by_human": "Pipeline cancelado por el usuario",
+    "developer_agent": "Developer Agent",
+    "security_agent": "Security Agent",
+    "testing_agent": "Testing Agent",
+    "reviewer_agent": "Reviewer Agent",
+    "advance_iteration": "Actualizando contador de iteración",
+    "escalate_to_human": "Escalando a revisión humana",
+}
 
 
 def _parse_args(argv: list[str] | None) -> argparse.Namespace:
@@ -117,8 +141,17 @@ def main(argv: list[str] | None = None) -> int:
     estado_inicial = create_initial_state(requirement)
     config = None if args.no_trace else default_invoke_config()
 
+    resultado: dict = dict(estado_inicial)
     try:
-        resultado = grafo.invoke(estado_inicial, config=config)
+        for evento in grafo.stream(estado_inicial, config=config, stream_mode="updates"):
+            for nodo, actualizacion in evento.items():
+                etiqueta = _NODE_LABELS.get(nodo, nodo)
+                print(f"   >> [{etiqueta}] completado.")
+                for clave, valor in actualizacion.items():
+                    if clave in ("messages", "errors"):
+                        resultado[clave] = resultado.get(clave, []) + valor
+                    else:
+                        resultado[clave] = valor
     except NodeExecutionError as exc:
         print(f"\nERROR - el pipeline falló en el nodo '{exc.node_name}': {exc.original}", file=sys.stderr)
         return 1
@@ -141,6 +174,8 @@ def main(argv: list[str] | None = None) -> int:
     review = resultado.get("review", {})
     if review.get("status") == "APPROVED":
         return 0
+    if review.get("status") == "CANCELLED":
+        return 3
     if resultado.get("human_review_required"):
         return 2
     return 1

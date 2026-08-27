@@ -61,6 +61,16 @@ Decisiones (Fase 6 de Guia_Construccion.md, agente 5/6):
       tests pasan".
     - Cliente LLM vía agents/llm_factory.py (build_llm), igual que los
       cuatro agentes anteriores.
+    - print() por turno y por tool call dentro del ciclo ReAct: mismo motivo
+      que developer_agent.py — sin esto, la terminal queda en silencio total
+      durante los ~12 turnos posibles de este agente.
+    - asyncio.to_thread() + invoke_with_retry() (agents/mcp_tools.py) en la
+      llamada al LLM del ciclo, más un try/except alrededor que corta el
+      ciclo (sin tumbar el pipeline) ante cualquier error que
+      invoke_with_retry no pudo resolver (429 persistente, 413 "Request too
+      large", 400 por tool alucinada) — mismo fix y mismas causas reales
+      confirmadas que developer_agent.py; ver el docstring de ese archivo
+      para el detalle completo del diagnóstico.
 """
 
 import asyncio
@@ -84,6 +94,7 @@ if __package__ in (None, ""):
 from agents.llm_factory import build_llm, invoke_structured
 from agents.mcp_tools import (
     REPO_ROOT,
+    invoke_with_retry,
     mcp_server_params,
     result_text,
     summarize_args,
@@ -98,8 +109,12 @@ load_dotenv()
 
 __all__ = ["TestingSummary", "testing_agent"]
 
-MAX_TOOL_ITERATIONS = 12
-_TOOL_RESULT_CHAR_LIMIT = 4000
+MAX_TOOL_ITERATIONS = 8  # bajado de 12, mismo motivo que developer_agent.py: cada
+# turno es una llamada LLM real; explorar los proyectos de test existentes + correr
+# run_tests (obligatorio) + opcionalmente agregar 1-2 casos alcanza con este límite.
+_TOOL_RESULT_CHAR_LIMIT = 1500  # bajado de 4000, mismo motivo que developer_agent.py:
+# evitar el 413 "Request too large" de Groq (límite de 8000 tokens/minuto) cuando el
+# historial acumulado de varios turnos supera lo que una sola petición puede pesar.
 
 _SYSTEM_PROMPT = """\
 Eres un QA engineer senior de un estudio de ingeniería. Recibes lo que el
@@ -108,6 +123,14 @@ criterios de aceptación de la especificación original, y fragmentos reales
 de la estrategia de testing del equipo. Tu trabajo es verificar de forma
 OBJETIVA que la implementación funciona, ejecutando pruebas reales — nunca
 afirmes un resultado de pruebas sin haberlo corrido.
+
+Las ÚNICAS tools que existen son: list_files, read_file, search_code,
+create_file, update_file, run_tests. No existe ninguna otra herramienta bajo
+ningún nombre (ej. NO existe "print_tree", "get_tree", "show_structure" ni
+ninguna variante para "ver el árbol de carpetas") — si necesitás la
+estructura del repositorio, list_files() ya te la devuelve completa y
+recursiva en un solo llamado. Si intentás llamar una tool que no está en
+esta lista exacta, la llamada falla y perdés el turno.
 
 Instrucciones:
 - Explora el repositorio (list_files, read_file, search_code) para encontrar
@@ -210,12 +233,29 @@ async def _run_tool_loop(
             run_tests_calls: list[dict] = []
             pasos: list[str] = []
 
-            for _ in range(MAX_TOOL_ITERATIONS):
-                ai_message = llm_with_tools.invoke(messages)
+            for turno in range(1, MAX_TOOL_ITERATIONS + 1):
+                print(f"      [Testing Agent] turno {turno}/{MAX_TOOL_ITERATIONS}: consultando al LLM...")
+                # asyncio.to_thread + invoke_with_retry (agents/mcp_tools.py): ver la
+                # decisión detallada en agents/developer_agent.py — reintenta ante 429
+                # (rate limit) sobre el mismo cliente, sin cambiar de proveedor a mitad
+                # de conversación.
+                try:
+                    ai_message = await asyncio.to_thread(invoke_with_retry, llm_with_tools, messages)
+                except Exception as error:
+                    # Ver la decisión detallada en agents/developer_agent.py: cualquier
+                    # error del LLM que invoke_with_retry no pudo resolver corta el
+                    # ciclo acá (igual que MAX_TOOL_ITERATIONS agotado) en vez de tumbar
+                    # todo el pipeline — se sigue al resumen final con lo ya logrado.
+                    print(f"      [Testing Agent] ALERTA - error irrecuperable del LLM en el turno {turno}, cortando el ciclo: {error}")
+                    pasos.append(f"⚠ el ciclo se cortó en el turno {turno} por un error del LLM: {error}")
+                    break
                 messages.append(ai_message)
                 if not ai_message.tool_calls:
+                    print("      [Testing Agent] el modelo no pidió más tools; ciclo terminado.")
                     break
                 for tool_call in ai_message.tool_calls:
+                    args_resumen = summarize_args(tool_call.get("args", {}))
+                    print(f"      [Testing Agent] -> {tool_call['name']}({args_resumen})")
                     result = await session.call_tool(
                         tool_call["name"], tool_call.get("args", {})
                     )
@@ -233,6 +273,7 @@ async def _run_tool_loop(
                             pass
 
                     estado = "ERROR" if is_error else "OK"
+                    print(f"      [Testing Agent]    {estado}")
                     pasos.append(
                         f"{tool_call['name']}({summarize_args(tool_call.get('args', {}))}) -> {estado}"
                     )
@@ -366,10 +407,16 @@ if __name__ == "__main__":
     print(f"   OK - {repo_target!r} existe.")
 
     print("3. Armando un estado con implementation de prueba (simulando al Developer Agent)...")
-    state = create_initial_state(
+    requerimiento_ejemplo = sys.argv[1] if len(sys.argv) > 1 else (
         "Como empleado quiero poder solicitar vacaciones indicando fecha de inicio "
         "y fin, y que mi jefe directo apruebe o rechace la solicitud."
     )
+    state = create_initial_state(requerimiento_ejemplo)
+    if len(sys.argv) > 1:
+        print(
+            "   (nota: requirement personalizado; la implementation de prueba de abajo "
+            "sigue siendo la del ejemplo de vacaciones, no se deriva de tu texto)"
+        )
     state["specification"] = {
         "resumen": "Flujo de solicitud y aprobación de vacaciones entre empleado y aprobador.",
         "actores": ["Empleado", "Aprobador"],

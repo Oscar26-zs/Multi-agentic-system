@@ -44,7 +44,13 @@ import agents.reviewer_agent as reviewer_mod
 import agents.security_agent as security_mod
 from agents.architect_agent import ArchitectureProposal, TechnicalDecision, architect_agent
 from agents.developer_agent import developer_agent
-from agents.mcp_tools import result_text, summarize_args, track_file_change, tool_to_openai_schema
+from agents.mcp_tools import (
+    invoke_with_retry,
+    result_text,
+    summarize_args,
+    track_file_change,
+    tool_to_openai_schema,
+)
 from agents.product_agent import ProductSpecification, product_agent
 from agents.reviewer_agent import ReviewVerdict, _coerce_verdict, reviewer_agent
 from agents.security_agent import SecurityFinding, SecurityReview, security_agent
@@ -276,6 +282,58 @@ def test_summarize_args_prioriza_file_path():
     assert summarize_args({"file_path": "a.cs", "content": "x"}) == "a.cs"
     assert summarize_args({"subpath": ""}) == "(raíz)"
     assert summarize_args({"query": "class X"}) == "'class X'"
+
+
+# ---------- invoke_with_retry (agents/mcp_tools.py) ----------
+
+
+class _FakeStatusError(Exception):
+    def __init__(self, status_code):
+        super().__init__(f"error {status_code}")
+        self.status_code = status_code
+
+
+def test_invoke_with_retry_reintenta_ante_429_y_devuelve_el_resultado(monkeypatch):
+    monkeypatch.setattr("agents.mcp_tools.time.sleep", lambda segundos: None)
+
+    llamadas = []
+
+    class FakeLLM:
+        def invoke(self, messages):
+            llamadas.append(1)
+            if len(llamadas) < 3:
+                raise _FakeStatusError(429)
+            return "respuesta ok"
+
+    resultado = invoke_with_retry(FakeLLM(), ["mensaje"], max_intentos=3)
+    assert resultado == "respuesta ok"
+    assert len(llamadas) == 3
+
+
+def test_invoke_with_retry_no_reintenta_errores_distintos_de_429(monkeypatch):
+    monkeypatch.setattr("agents.mcp_tools.time.sleep", lambda segundos: None)
+
+    llamadas = []
+
+    class FakeLLM:
+        def invoke(self, messages):
+            llamadas.append(1)
+            raise _FakeStatusError(404)
+
+    with pytest.raises(_FakeStatusError):
+        invoke_with_retry(FakeLLM(), ["mensaje"], max_intentos=3)
+    assert len(llamadas) == 1, "un 404 no debería reintentarse"
+
+
+def test_invoke_with_retry_lanza_si_se_agotan_los_intentos_con_429_persistente(monkeypatch):
+    monkeypatch.setattr("agents.mcp_tools.time.sleep", lambda segundos: None)
+
+    class FakeLLM:
+        def invoke(self, messages):
+            raise _FakeStatusError(429)
+
+    with pytest.raises(_FakeStatusError):
+        invoke_with_retry(FakeLLM(), ["mensaje"], max_intentos=2)
 
 
 # ---------- reviewer_agent ----------

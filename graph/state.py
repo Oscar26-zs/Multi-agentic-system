@@ -46,7 +46,10 @@ class EngineeringState(TypedDict):
     test_results: dict        # Testing Agent: casos ejecutados, pass/fail, cobertura
 
     # --- Veredicto final ---
-    review: dict              # Reviewer Agent: status APPROVED|REJECTED, feedback, return_to
+    review: dict              # Reviewer Agent: status APPROVED|REJECTED|CANCELLED, feedback, return_to
+
+    # --- Human-in-the-Loop: aprobación del plan antes de tocar el repo real ---
+    plan_approval: dict       # request_plan_approval (graph/edges.py): {"approved": bool, "note": str}
 
     # --- Control del ciclo de revisión ---
     iteration: int            # contador de vueltas del ciclo; lo compara MAX_ITERATIONS en workflow.py
@@ -73,6 +76,7 @@ def create_initial_state(requirement: str) -> EngineeringState:
         "security_review": {},
         "test_results": {},
         "review": {},
+        "plan_approval": {},
         "iteration": 0,
         "messages": [],
         "errors": [],

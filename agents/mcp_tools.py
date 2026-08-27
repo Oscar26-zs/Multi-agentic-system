@@ -25,11 +25,25 @@ Decisiones:
       un set ni en un dict): devuelve una tupla y deja que cada agente decida
       cómo guardarla, porque developer_agent.py necesita el diff completo y
       testing_agent.py solo necesita saber qué archivo se tocó.
+    - invoke_with_retry() nace tras un 429 real de Groq en producción
+      ("Rate limit reached... tokens per minute"): a diferencia de
+      agents/llm_factory.py (build_llm/invoke_structured), el LLM del ciclo
+      ReAct se bindea con bind_tools() UNA sola vez al principio del ciclo
+      (ver decisión en agents/developer_agent.py: cambiar de proveedor a
+      mitad de conversación rompería el formato de tool calls ya
+      establecido) — así que no tenía NINGÚN reintento propio, y un 429 crudo
+      del proveedor reventaba sin manejo dentro del contexto async que
+      mantiene la sesión MCP abierta (visto como "unhandled errors in a
+      TaskGroup"). Esta función reintenta con espera ante 429 SOBRE EL MISMO
+      cliente (nunca cambia de proveedor a mitad de conversación); para
+      cualquier otro error, no reintenta — no tiene sentido esperar por algo
+      que no se va a arreglar solo.
 """
 
 import difflib
 import json
 import sys
+import time
 from pathlib import Path
 
 from mcp import StdioServerParameters
@@ -44,6 +58,7 @@ __all__ = [
     "summarize_args",
     "unified_diff",
     "track_file_change",
+    "invoke_with_retry",
 ]
 
 
@@ -97,6 +112,27 @@ def unified_diff(old_text: str, new_text: str, file_path: str) -> str:
         tofile=f"b/{file_path}",
     )
     return "".join(diff_lines)
+
+
+def invoke_with_retry(llm_with_tools, messages: list, max_intentos: int = 3, espera_base: float = 5.0):
+    """Invoca el LLM (ya bindeado con bind_tools) reintentando ante 429 (rate
+    limit) con espera creciente. NUNCA cambia de proveedor a mitad de
+    conversación — solo reintenta con el mismo cliente. Cualquier error que
+    no sea 429 se relanza de inmediato, sin reintentar.
+    """
+    for intento in range(1, max_intentos + 1):
+        try:
+            return llm_with_tools.invoke(messages)
+        except Exception as error:
+            status_code = getattr(error, "status_code", None)
+            if status_code != 429 or intento == max_intentos:
+                raise
+            espera = espera_base * intento
+            print(
+                f"      REINTENTANDO tras rate limit (429), esperando {espera:.0f}s "
+                f"(intento {intento + 1}/{max_intentos})..."
+            )
+            time.sleep(espera)
 
 
 def track_file_change(tool_call: dict, text: str, is_error: bool) -> tuple[str, str, str] | None:
