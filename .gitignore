@@ -3,7 +3,6 @@
 .venv-1/
 
 # Secretos
-.env
 
 # Artefactos generados (vector store, caches)
 chroma_db/

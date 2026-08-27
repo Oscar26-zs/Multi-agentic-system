@@ -21,14 +21,15 @@ Decisiones:
       dos agentes anteriores (salida determinista para documentos técnicos),
       pero queda parametrizable por si un agente futuro necesita más
       variabilidad (ej. redacción de mensajes al usuario).
-    - Fallback multi-proveedor (NVIDIA NIM -> Groq -> Google AI Studio ->
-      OpenRouter): los modelos gratuitos tienen cuotas compartidas
-      impredecibles; si uno falla (rate limit, modelo caído, key inválida),
-      build_llm() prueba el siguiente en vez de tumbar el agente. NVIDIA va
-      primero porque hostea directamente el modelo (nemotron) para el que ya
-      están afinados los prompts (method="function_calling" en cada agente);
-      OpenRouter queda último como red de seguridad porque es el proveedor
-      original, ya confirmado que funciona.
+    - Fallback multi-proveedor (OpenRouter -> NVIDIA NIM -> Groq -> Google AI
+      Studio): los modelos gratuitos tienen cuotas compartidas impredecibles;
+      si uno falla (rate limit, modelo caído, key inválida, timeout),
+      build_llm() prueba el siguiente en vez de tumbar el agente. Orden
+      reordenado tras uso real: NVIDIA empezó primero (hostea directamente el
+      modelo nemotron para el que están afinados los prompts,
+      method="function_calling"), pero en la práctica quedó dando timeout de
+      forma repetida mientras OpenRouter respondía rápido y confiable — se
+      movió OpenRouter al frente por eso, no por diseño original.
     - La selección se hace UNA SOLA VEZ por llamada a build_llm(), no por
       cada turno de una conversación: developer_agent.py y testing_agent.py
       hacen bind_tools() sobre el resultado y lo reusan durante todo su ciclo
@@ -60,6 +61,17 @@ Decisiones:
       key inválida, 404 modelo no existe, 400 request mal formada) NUNCA se
       reintenta: no se va a arreglar solo, y esperar ahí solo demora llegar al
       siguiente proveedor.
+    - timeout=_REQUEST_TIMEOUT_SECONDS explícito en TODO ChatOpenAI(...): sin
+      esto, el cliente usa el default del SDK de openai (varios minutos) y,
+      peor, si el servidor deja la conexión abierta sin mandar más datos (no
+      responde con error, simplemente no responde), el socket puede quedarse
+      esperando de forma indefinida. Se observó en producción una corrida real
+      donde un turno del ciclo ReAct de developer_agent.py tardó más de 1 HORA
+      entre un intento y el siguiente — sin este timeout, ni el reintento ni
+      el fallback a otro proveedor se disparan nunca, porque la excepción que
+      los activa jamás llega. Con el timeout, el peor caso pasa de
+      "potencialmente indefinido" a `_MAX_INTENTOS_POR_PROVEEDOR` x
+      len(_PROVEEDORES) x _REQUEST_TIMEOUT_SECONDS como cota superior real.
 """
 
 import os
@@ -72,8 +84,15 @@ __all__ = ["build_llm", "invoke_structured"]
 
 _MAX_INTENTOS_POR_PROVEEDOR = 2  # intento original + 1 reintento
 _RETRY_DELAY_SECONDS = 2.0
+_REQUEST_TIMEOUT_SECONDS = 600.0  # cota dura por intento (10 min): evita cuelgues indefinidos de socket
 
 _PROVEEDORES = [
+    {
+        "nombre": "OpenRouter",
+        "api_key_env": "OPENROUTER_API_KEY",
+        "base_url": os.getenv("LLM_BASE_URL", "https://openrouter.ai/api/v1"),
+        "model": os.getenv("LLM_MODEL_NAME", "nvidia/nemotron-3.5-lightning:free"),
+    },
     {
         "nombre": "NVIDIA NIM",
         "api_key_env": "NVIDIA_API_KEY",
@@ -93,12 +112,6 @@ _PROVEEDORES = [
             "GOOGLE_BASE_URL", "https://generativelanguage.googleapis.com/v1beta/openai/"
         ),
         "model": os.getenv("GOOGLE_MODEL_NAME", "gemini-2.0-flash"),
-    },
-    {
-        "nombre": "OpenRouter",
-        "api_key_env": "OPENROUTER_API_KEY",
-        "base_url": os.getenv("LLM_BASE_URL", "https://openrouter.ai/api/v1"),
-        "model": os.getenv("LLM_MODEL_NAME", "nvidia/nemotron-3.5-lightning:free"),
     },
 ]
 
@@ -133,6 +146,7 @@ def _probar_proveedor(proveedor: dict, temperature: float) -> ChatOpenAI | None:
         base_url=proveedor["base_url"],
         api_key=api_key,
         temperature=temperature,
+        timeout=_REQUEST_TIMEOUT_SECONDS,
     )
     for intento in range(1, _MAX_INTENTOS_POR_PROVEEDOR + 1):
         try:
@@ -159,7 +173,7 @@ def _probar_proveedor(proveedor: dict, temperature: float) -> ChatOpenAI | None:
 def build_llm(temperature: float = 0) -> ChatOpenAI:
     """Construye el cliente LLM probando proveedores en orden hasta que uno responda.
 
-    Orden: NVIDIA NIM -> Groq -> Google AI Studio -> OpenRouter.
+    Orden: OpenRouter -> NVIDIA NIM -> Groq -> Google AI Studio.
     """
     for proveedor in _PROVEEDORES:
         llm = _probar_proveedor(proveedor, temperature)
@@ -204,6 +218,7 @@ def invoke_structured(schema, messages: list, method: str = "function_calling", 
             base_url=proveedor["base_url"],
             api_key=api_key,
             temperature=temperature,
+            timeout=_REQUEST_TIMEOUT_SECONDS,
         )
 
         resultado = None
