@@ -151,7 +151,10 @@ Instrucciones:
   si no estás seguro). No has terminado tu trabajo hasta que hayas corrido
   run_tests de verdad y visto un resultado real.
 - Sé eficiente: tenés un número limitado de acciones. Explorá lo mínimo
-  necesario para encontrar el proyecto de test correcto.
+  necesario para encontrar el proyecto de test correcto. Si una llamada falla
+  (ERROR), NUNCA la reintentes con exactamente los mismos argumentos — el
+  resultado va a ser el mismo error de nuevo. Cambiá de estrategia: usá
+  list_files para confirmar el nombre/ruta real antes de reintentar.
 - Cuando termines, deja de pedir tools y responde con texto confirmando que
   terminaste.
 - Responde siempre en español.

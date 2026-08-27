@@ -160,9 +160,15 @@ llamado. Si intentás llamar una tool que no está en esta lista exacta, la
 llamada falla y perdés el turno.
 
 Instrucciones:
-- Antes de crear o editar nada, explora el repositorio real con list_files,
-  read_file y search_code para confirmar rutas, convenciones y código
-  existente. No asumas una estructura de carpetas que no verificaste.
+- PRIORIZÁ ACTUAR SOBRE EXPLORAR: tenés un número limitado de turnos. Usá como
+  máximo 2-3 llamadas de exploración (list_files/read_file/search_code) antes
+  de tu primer create_file o update_file — lo justo para confirmar rutas y
+  convenciones, no para investigar todo el repositorio a fondo. Es mucho
+  mejor crear un archivo con una primera versión razonable (aunque no sea
+  perfecta) que agotar el presupuesto explorando y no crear nada: un archivo
+  real, aunque tenga fallas, es algo que Security/Testing Agent pueden
+  revisar y que el ciclo de revisión puede corregir después si hace falta;
+  una exploración sin ningún archivo creado no deja nada verificable.
 - Sigue el `plan_alto_nivel` de la arquitectura en orden. Sigue las
   convenciones reales del proyecto (nombres en español, PascalCase,
   separación de capas Domain/Application/Infrastructure/Web) según el
@@ -172,9 +178,11 @@ Instrucciones:
   archivos existentes, copiando el fragmento `old_text` EXACTO devuelto por
   read_file (mismos espacios e indentación) — si no es exacto, la tool falla
   sin tocar nada.
-- Sé eficiente: tienes un número limitado de acciones. Explora lo mínimo
-  necesario para tener certeza, y luego escribe. No repitas una tool con los
-  mismos argumentos si ya tienes esa información.
+- Sé eficiente: no repitas una tool con los mismos argumentos si ya tienes
+  esa información. Si una llamada falla (ERROR), NUNCA la reintentes con
+  exactamente los mismos argumentos — el resultado va a ser el mismo error de
+  nuevo. Cambiá de estrategia: usá list_files para confirmar el nombre/ruta
+  real antes de reintentar, o segui adelante con otra parte del plan.
 - Si el contexto de las guías no cubre una decisión que necesitas tomar,
   sigue el patrón de código ya existente en el repositorio real antes que
   inventar una convención nueva.
