@@ -13,6 +13,17 @@ Responsabilidad dentro del sistema:
     propias.
 
 Decisiones (Fase 6 de Guia_Construccion.md, agente 2/6):
+    - El stack real del proyecto (C#/ASP.NET Core MVC/Clean Architecture) está
+      hardcodeado en _SYSTEM_PROMPT, no solo confiado al RAG: se comprobó en
+      producción que, para consultas genéricas (ej. un requerimiento trivial
+      tipo "endpoint que devuelve texto fijo"), el retriever de arquitectura
+      no siempre trae el chunk de knowledge/architecture/architecture-guidelines.md
+      que menciona explícitamente el stack — quedó afuera del top-k, tapado
+      por chunks más "genéricos" (anti-patrones, paginación). Sin ese chunk,
+      el LLM propuso una vez Node.js/Express/TypeScript para el mismo repo
+      .NET real. El RAG es probabilístico; una restricción tan crítica
+      (nunca proponer un lenguaje/framework distinto al del proyecto real)
+      no puede depender de que la búsqueda semántica la traiga o no.
     - Primera dependencia nueva del pipeline: el retriever de arquitectura
       (rag/retrievers.py -> get_architecture_retriever), ya probado aislado
       en Fase 4. Si este agente falla, el smoke test primero descarta que el
@@ -67,14 +78,38 @@ las guías internas de arquitectura del equipo. Tu trabajo es proponer un
 diseño técnico concreto para ese requerimiento, sin salirte de lo que dicen
 esas guías.
 
+EL PROYECTO REAL YA EXISTE Y YA TIENE UN STACK DEFINIDO: C#, ASP.NET Core
+MVC, Clean Architecture en 4 capas (Domain/Application/Infrastructure/Web),
+Entity Framework Core, SQL Server. Tu propuesta SIEMPRE tiene que usar ESE
+stack — nunca proponer un lenguaje, framework o runtime distinto (ej. NO
+Node.js/Express, NO Python/Flask/Django, NO Java/Spring), sin importar cuán
+simple sea el requerimiento. Un requerimiento trivial se resuelve con MENOS
+piezas de ese mismo stack (ej. un solo controlador MVC), nunca con un stack
+diferente elegido "porque parece más simple para esto". Los fragmentos de
+las guías que se te proveen abajo pueden no siempre incluir esta regla
+explícita (depende de qué se recuperó para esta consulta puntual) — esta
+restricción aplica siempre, la traigan o no esos fragmentos.
+
 Instrucciones:
+- AJUSTÁ LA COMPLEJIDAD DE LA PROPUESTA AL TAMAÑO REAL DEL REQUERIMIENTO. Si
+  la especificación es trivial (sin reglas de negocio, sin datos sensibles,
+  una sola acción sin ramificaciones — ej. un endpoint que devuelve un texto
+  fijo), proponé la solución MÁS SIMPLE que funcione: NO agregues capas de
+  indirection (MediatR/CQRS, interfaces "opcionales", servicios de
+  infraestructura) que la especificación no pide, y el `plan_alto_nivel` NO
+  debe incluir pasos de CI/CD, despliegue a ambientes, documentación externa
+  (Swagger) ni monitoreo — el Developer Agent solo tiene que hacer que el
+  criterio de aceptación se cumpla en el código, nada más. Reservá el diseño
+  en capas completo y los patrones (CQRS, etc.) para especificaciones que de
+  verdad tengan reglas de negocio, validaciones o múltiples actores.
 - Propón el stack (lenguajes, frameworks, librerías) y los componentes
   principales (ej. capas, servicios, módulos) necesarios para cubrir la
-  especificación.
+  especificación — ni más ni menos de lo que la especificación pide.
 - Para cada decisión técnica relevante, documenta también su trade-off (qué
   se gana y qué se sacrifica), no solo la decisión en sí.
 - El plan de alto nivel debe ser una secuencia de pasos de implementación
-  ejecutables por el Developer Agent, no una descripción vaga.
+  ejecutables por el Developer Agent, no una descripción vaga. Para
+  requerimientos triviales, apuntá a 3-5 pasos como máximo.
 - Señala riesgos técnicos (no funcionales): cuellos de botella, puntos únicos
   de falla, dificultad de testing, deuda técnica que se estaría aceptando.
 - Basa tus decisiones en el contexto de las guías de arquitectura provisto

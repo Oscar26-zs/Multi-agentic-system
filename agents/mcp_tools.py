@@ -38,15 +38,33 @@ Decisiones:
       cliente (nunca cambia de proveedor a mitad de conversación); para
       cualquier otro error, no reintenta — no tiene sentido esperar por algo
       que no se va a arreglar solo.
+    - FileChange / run_exploration_loop() / apply_file_changes() nacen de
+      separar "planificar" de "ejecutar" en developer_agent.py y
+      testing_agent.py: el ciclo ReAct original (explorar Y escribir en la
+      misma conversación abierta) hacía crecer el historial en cada turno
+      hasta romper el límite de tokens/minuto del proveedor (413), y dejaba
+      la escritura real a merced de que el LLM no alucinara una tool a mitad
+      de una conversación larga (pasó de verdad: "print_tree"). Ahora:
+      run_exploration_loop() corre un ciclo ReAct CORTO bindeado SOLO con
+      tools de lectura (nunca con create_file/update_file/run_tests, así la
+      escritura queda estructuralmente imposible en esta fase) para juntar
+      contexto; con eso, el agente pide UNA sola salida estructurada (un
+      plan compacto, no más conversación abierta); apply_file_changes()
+      ejecuta ese plan iterando en Python, sin ningún LLM de por medio — la
+      parte mecánica deja de costar tokens y de poder alucinar una tool.
 """
 
+import asyncio
 import difflib
 import json
 import sys
 import time
 from pathlib import Path
+from typing import Literal
 
+from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
 from mcp import StdioServerParameters
+from pydantic import BaseModel, Field
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -59,6 +77,10 @@ __all__ = [
     "unified_diff",
     "track_file_change",
     "invoke_with_retry",
+    "FileChange",
+    "run_exploration_loop",
+    "summarize_exploration",
+    "apply_file_changes",
 ]
 
 
@@ -158,3 +180,150 @@ def track_file_change(tool_call: dict, text: str, is_error: bool) -> tuple[str, 
         diff = unified_diff(args.get("old_text", ""), args.get("new_text", ""), file_path)
         return file_path, "modificado", diff
     return None
+
+
+class FileChange(BaseModel):
+    """Un cambio de archivo propuesto por un plan estructurado (developer_agent.py
+    o testing_agent.py) — se ejecuta luego con apply_file_changes(), sin LLM."""
+
+    file_path: str = Field(..., description="Ruta del archivo, relativa a la raíz del repo objetivo.")
+    accion: Literal["crear", "editar"] = Field(
+        ..., description="'crear' para un archivo nuevo, 'editar' para uno existente."
+    )
+    contenido: str = Field(
+        default="", description="Contenido completo del archivo nuevo; obligatorio si accion='crear'."
+    )
+    old_text: str = Field(
+        default="",
+        description="Fragmento EXACTO (mismos espacios/indentación) a reemplazar; obligatorio si accion='editar'.",
+    )
+    new_text: str = Field(default="", description="Texto de reemplazo; obligatorio si accion='editar'.")
+    razon: str = Field(..., description="Por qué hace falta este cambio puntual (trazabilidad).")
+
+
+async def run_exploration_loop(
+    session,
+    llm,
+    system_prompt: str,
+    human_message: str,
+    max_turnos: int,
+    nombre_agente: str,
+    tool_result_char_limit: int = 1500,
+) -> list:
+    """Ciclo ReAct CORTO bindeado SOLO con tools de lectura (list_files,
+    read_file, search_code) — nunca con create_file/update_file/run_tests, así
+    la escritura queda estructuralmente imposible en esta fase. Junta el
+    contexto mínimo necesario para que el caller pida después un plan
+    estructurado (invoke_structured) con ese contexto.
+
+    Devuelve la lista de `messages` acumulada (System/Human/AI/Tool), lista
+    para pasarla como contexto de la llamada que pide el plan final.
+    """
+    tools_result = await session.list_tools()
+    tools_lectura = [
+        tool_to_openai_schema(t)
+        for t in tools_result.tools
+        if t.name in ("list_files", "read_file", "search_code")
+    ]
+    llm_with_tools = llm.bind_tools(tools_lectura)
+    messages: list = [SystemMessage(content=system_prompt), HumanMessage(content=human_message)]
+
+    for turno in range(1, max_turnos + 1):
+        print(f"      [{nombre_agente}] exploración {turno}/{max_turnos}: consultando al LLM...")
+        try:
+            ai_message = await asyncio.to_thread(invoke_with_retry, llm_with_tools, messages)
+        except Exception as error:
+            # Mismo criterio que el resto del sistema: un error del LLM acá no
+            # debe tumbar nada — se corta la exploración con lo que se alcanzó
+            # a juntar, y el caller igual pide el plan con ese contexto parcial.
+            print(f"      [{nombre_agente}] ALERTA - error irrecuperable del LLM explorando, cortando: {error}")
+            break
+        messages.append(ai_message)
+        if not ai_message.tool_calls:
+            print(f"      [{nombre_agente}] el modelo no pidió más exploración; listo para el plan.")
+            break
+        for tool_call in ai_message.tool_calls:
+            args_resumen = summarize_args(tool_call.get("args", {}))
+            print(f"      [{nombre_agente}] -> {tool_call['name']}({args_resumen})")
+            result = await session.call_tool(tool_call["name"], tool_call.get("args", {}))
+            text = result_text(result)
+            is_error = bool(getattr(result, "is_error", False))
+            print(f"      [{nombre_agente}]    {'ERROR' if is_error else 'OK'}")
+            messages.append(
+                ToolMessage(content=text[:tool_result_char_limit], tool_call_id=tool_call["id"])
+            )
+
+    return messages
+
+
+def summarize_exploration(messages: list) -> str:
+    """Convierte la lista de messages de run_exploration_loop() (System/Human/
+    AI-con-tool_calls/Tool) en un resumen de texto plano, SIN ningún mensaje
+    de "el agente llamó una tool" a la vista.
+
+    Nace de un problema real reproducido dos veces en producción: al pedirle
+    el plan estructurado final reenviando la conversación cruda de
+    exploración (con los AIMessage que tienen tool_calls), el modelo
+    "reincidía" e intentaba volver a llamar list_files/read_file en esa
+    respuesta — aunque el prompt le dijera explícitamente que ya no había
+    tools disponibles. No es un problema de instrucciones poco claras: el
+    modelo ve su propio turno anterior llamando una tool y repite el patrón
+    por inercia. La solución es no reenviar esa conversación cruda: se arma
+    un resumen de texto plano de los RESULTADOS (sin los objetos AIMessage
+    con tool_calls) y se le pide el plan en un contexto nuevo de 2 mensajes,
+    donde no hay ningún turno previo de tool-calling que el modelo pueda
+    "continuar" reflexivamente.
+    """
+    partes: list[str] = []
+    for msg in messages:
+        if isinstance(msg, ToolMessage):
+            partes.append(f"Resultado: {msg.content}")
+        elif getattr(msg, "tool_calls", None):
+            nombres = ", ".join(tc["name"] for tc in msg.tool_calls)
+            partes.append(f"[se consultó: {nombres}]")
+    return "\n\n".join(partes) if partes else "(no se exploró nada — sin llamadas a tools)"
+
+
+async def apply_file_changes(
+    session, cambios: list[FileChange], nombre_agente: str
+) -> tuple[list[str], list[str], dict, list[str]]:
+    """Ejecuta una lista de FileChange contra el servidor MCP real — SIN LLM,
+    puro Python iterando la lista. Devuelve (archivos_creados,
+    archivos_modificados, diffs, pasos), mismo shape que ya devolvía el ciclo
+    ReAct anterior, para no tener que tocar el resto de cada agente.
+    """
+    archivos_creados: list[str] = []
+    archivos_modificados: list[str] = []
+    diffs: dict = {}
+    pasos: list[str] = []
+
+    for cambio in cambios:
+        print(f"      [{nombre_agente}] -> {cambio.accion}({cambio.file_path})")
+        if cambio.accion == "crear":
+            result = await session.call_tool(
+                "create_file", {"file_path": cambio.file_path, "content": cambio.contenido}
+            )
+        else:
+            result = await session.call_tool(
+                "update_file",
+                {
+                    "file_path": cambio.file_path,
+                    "old_text": cambio.old_text,
+                    "new_text": cambio.new_text,
+                },
+            )
+        text = result_text(result)
+        is_error = bool(getattr(result, "is_error", False))
+        estado = "ERROR" if is_error else "OK"
+        print(f"      [{nombre_agente}]    {estado}")
+        pasos.append(f"{cambio.accion}({cambio.file_path}) -> {estado}: {cambio.razon}")
+        if is_error:
+            continue
+        if cambio.accion == "crear":
+            archivos_creados.append(cambio.file_path)
+            diffs[cambio.file_path] = unified_diff("", cambio.contenido, cambio.file_path)
+        else:
+            archivos_modificados.append(cambio.file_path)
+            diffs[cambio.file_path] = unified_diff(cambio.old_text, cambio.new_text, cambio.file_path)
+
+    return archivos_creados, archivos_modificados, diffs, pasos

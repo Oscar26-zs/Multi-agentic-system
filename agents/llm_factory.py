@@ -112,7 +112,7 @@ _PROVEEDORES = [
         "base_url": os.getenv(
             "GOOGLE_BASE_URL", "https://generativelanguage.googleapis.com/v1beta/openai/"
         ),
-        "model": os.getenv("GOOGLE_MODEL_NAME", "gemini-2.0-flash"),
+        "model": os.getenv("GOOGLE_MODEL_NAME", "gemini-3.6-flash"),
     },
 ]
 

@@ -1,13 +1,12 @@
-
 """Agente Desarrollador (developer_agent).
 
 Qué hace:
     Lee la propuesta técnica del Architect Agent (y la especificación
     funcional como contexto de negocio), consulta el RAG de desarrollo
-    (knowledge/development/) y ejecuta un ciclo de tool-calling contra el
-    servidor MCP propio (mcp_server/server.py) para explorar el repositorio
-    real y crear/editar archivos, implementando el `plan_alto_nivel` de la
-    arquitectura.
+    (knowledge/development/) y en dos fases contra el servidor MCP real:
+    (1) explora el repositorio real lo mínimo necesario y (2) ejecuta un plan
+    estructurado y compacto de cambios de archivo — sin ciclo abierto de
+    tool-calling para la escritura.
 
 Responsabilidad dentro del sistema:
     Único agente autorizado a modificar código del repositorio objetivo.
@@ -22,79 +21,58 @@ Decisiones (Fase 6 de Guia_Construccion.md, agente 4/6):
       `security_review`), el Developer Agent corre ANTES que el Security
       Agent — `state["security_review"]` todavía no existe en ese punto del
       flujo. Por eso este agente solo depende de `architecture` (obligatoria)
-      y `specification` (opcional, como contexto de negocio), igual que la
-      Fase 6 de la guía lo prueba: "pasarle una architecture de prueba".
+      y `specification` (opcional, como contexto de negocio).
     - Conexión MCP vía protocolo real (stdio_client + ClientSession), no
       llamando las funciones de mcp_server/server.py directamente: así el
-      agente ejercita exactamente el mismo camino que un cliente MCP externo
-      (igual que tests/test_mcp_protocol.py), y las tools quedan
-      sandboxeadas del lado del servidor sin que este archivo conozca rutas
-      absolutas del repo objetivo.
-    - Las tools MCP listadas por el servidor (`session.list_tools()`) se
-      convierten a schema OpenAI-tools al vuelo (`agents/mcp_tools.py ->
-      tool_to_openai_schema`) y se bindean al LLM con `bind_tools()` — no se
-      usa un adapter de terceros (`langchain-mcp-adapters` no está en
-      requirements.txt): el schema de una `mcp.types.Tool`
-      (name/description/input_schema) ya calza 1:1 con el formato
-      `{"type": "function", "function": {...}}` que `bind_tools()` espera,
-      así que no hace falta una dependencia extra.
-    - La plomería de conexión MCP (lanzar el servidor, convertir tools,
-      trackear create_file/update_file) vive en agents/mcp_tools.py, no en
-      este archivo: se extrajo cuando testing_agent.py (agente 5/6) necesitó
-      exactamente el mismo ciclo — mismo criterio que agents/llm_factory.py.
-    - Ciclo ReAct manual con límite `MAX_TOOL_ITERATIONS`: en cada vuelta se
-      invoca al LLM con tools bindeadas: si no pide más tool calls, corta.
-      Si el límite se agota igual se sigue al resumen final (con lo hecho
-      hasta ahí), dejando una nota explícita en `pasos_seguidos` en vez de
-      fallar en silencio.
+      agente ejercita exactamente el mismo camino que un cliente MCP externo,
+      y las tools quedan sandboxeadas del lado del servidor.
+    - REDISEÑO: "planificar" separado de "ejecutar" (agents/mcp_tools.py ->
+      run_exploration_loop / apply_file_changes). El ciclo ReAct original
+      (un solo hilo de conversación que exploraba Y escribía, turno a turno)
+      hacía crecer el historial acumulado hasta romper el límite de
+      tokens/minuto del proveedor gratuito (413 "Request too large"), y
+      dejaba la escritura real a merced de que el LLM no alucinara una tool
+      a mitad de una conversación larga (pasó de verdad: "print_tree", que
+      nunca se le ofreció). Ahora:
+        1. run_exploration_loop() corre un ciclo CORTO (MAX_EXPLORATION_TURNS)
+           bindeado SOLO con tools de lectura — create_file/update_file ni
+           siquiera están disponibles en esta fase, así que la escritura
+           queda estructuralmente imposible de alucinar acá.
+        2. Con ese contexto, UNA sola llamada a invoke_structured() pide un
+           plan compacto (`DeveloperPlan`): la lista completa de cambios de
+           archivo, no más conversación abierta.
+        3. apply_file_changes() ejecuta esa lista iterando en Python — CERO
+           llamadas LLM adicionales para la parte mecánica de escribir.
+      Resultado: muchas menos llamadas LLM por corrida, contexto que nunca
+      vuelve a crecer sin límite, y la fase de escritura ya no puede
+      alucinar una tool porque no es el LLM quien la ejecuta.
+    - `resumen`/`notas` ahora vienen del propio `DeveloperPlan` (redactados
+      ANTES de ejecutar) — se eliminó la llamada final aparte a un
+      "ImplementationSummary" que existía en el diseño anterior, porque ya
+      no hace falta: no hay una conversación posterior de la que resumir "lo
+      que pasó", el resultado de la ejecución ya es 100% determinista
+      (`archivos_creados`/`archivos_modificados`/`diff`/`pasos_seguidos`, ver
+      abajo). Si algún cambio puntual falla al ejecutarse, queda registrado
+      en `pasos_seguidos` de forma determinista, no se le vuelve a preguntar
+      al LLM qué pasó.
     - `archivos_creados`, `archivos_modificados`, `diff` y `pasos_seguidos`
-      del `implementation` final se calculan en Python interceptando cada
-      `create_file`/`update_file` que el LLM ejecuta realmente vía MCP — NUNCA
-      se le pide al LLM que los recuerde de memoria al final del ciclo.
-      Mismo principio que `fuentes_consultadas` en architect_agent.py y
-      `aprobado` en security_agent.py, llevado un paso más allá: ni siquiera
-      se le pide esa parte al LLM (no solo se le corrige después), porque
-      tras varias vueltas de tool-calling un modelo gratuito tiende a
-      recordar mal rutas exactas o el contenido preciso de cada diff.
-    - El LLM sí redacta `resumen` y `notas` (desviaciones del plan,
-      limitaciones, seguimientos sugeridos) vía `ImplementationSummary`
-      (structured output), en una llamada aparte DESPUÉS del ciclo de tools:
-      es la única parte del reporte final que requiere criterio, no un hecho
-      verificable mecánicamente.
-    - `diff` se arma con `difflib.unified_diff` sobre el fragmento
-      reemplazado (`update_file`) o el archivo completo nuevo (`create_file`),
-      no con una tool `get_diff` (todavía no existe en mcp_server/server.py,
-      ver su docstring: "run_tests y get_diff se agregarán después").
-    - Cliente LLM vía agents/llm_factory.py (build_llm), igual que los tres
-      agentes anteriores.
-    - print() por turno y por tool call dentro del ciclo ReAct: corriendo
-      vía app.py (streaming por nodo), la terminal quedaba en silencio total
-      durante los ~12 turnos posibles de este agente — parecía "trabado" sin
-      forma de saber si seguía vivo. Con esto se ve cada consulta al LLM y
-      cada tool call en tiempo real, no solo el resultado final del nodo.
-    - asyncio.to_thread() + invoke_with_retry() (agents/mcp_tools.py) en la
-      llamada al LLM del ciclo: en producción se vio "unhandled errors in a
-      TaskGroup" en distintos turnos de corridas reales. Se descartó
-      experimentalmente que fuera un problema de bloqueo del event loop (un
-      script de prueba con time.sleep de hasta 90s vía asyncio.to_thread,
-      intercalado con llamadas MCP reales, no rompió nada) y se confirmó la
-      causa real en Langfuse: un 429 (rate limit de tokens/minuto de Groq)
-      crudo, sin manejar — este LLM se bindea una sola vez al principio del
-      ciclo (bind_tools) y, a diferencia de invoke_structured(), no tenía
-      ningún reintento propio. invoke_with_retry() reintenta ante 429 sobre
-      el MISMO cliente (nunca cambia de proveedor a mitad de conversación,
-      rompería el formato de tool calls ya establecido).
-    - El try/except alrededor de esa llamada, dentro del loop: 429 no fue el
-      único error real visto en producción — también un 413 ("Request too
-      large", historial acumulado superando el límite de tokens/minuto del
-      proveedor) y un 400 (el modelo alucinó una tool, "print_tree", que
-      nunca se le ofreció). Ninguno de los dos es recuperable reintentando.
-      En vez de seguir agregando casos especiales uno por uno, cualquier
-      error que invoke_with_retry no resuelva corta el ciclo ahí mismo — el
-      mismo tratamiento que ya tenía agotar MAX_TOOL_ITERATIONS: se sigue al
-      resumen final con el progreso real hecho hasta ese turno, en vez de
-      tumbar developer_agent (y con él, todo el pipeline) por un error del
-      LLM que no tiene nada que ver con si el trabajo ya hecho es válido.
+      se calculan en Python a partir de lo que `apply_file_changes()`
+      realmente ejecutó contra el MCP — nunca se le pide al LLM que los
+      recuerde de memoria. Mismo principio que `fuentes_consultadas` en
+      architect_agent.py y `aprobado` en security_agent.py.
+    - `diff` se arma con `difflib.unified_diff` (agents/mcp_tools.py) sobre
+      el `contenido` propuesto (`crear`) o `old_text`/`new_text` (`editar`),
+      no con una tool `get_diff` (no existe en mcp_server/server.py).
+    - Cliente LLM vía agents/llm_factory.py (build_llm/invoke_structured),
+      igual que los demás agentes.
+    - print() por fase/turno/cambio: corriendo vía app.py (streaming por
+      nodo), la terminal quedaba en silencio total durante toda la corrida de
+      este agente — con esto se ve cada paso en tiempo real.
+    - MAX_EXPLORATION_TURNS (antes MAX_TOOL_ITERATIONS) ahora limita SOLO la
+      fase de exploración (ya no también la escritura, que no tiene límite de
+      turnos propio — apply_file_changes() ejecuta todos los cambios del plan
+      de una vez). Se puede mantener bajo (5) porque ya no tiene que cubrir
+      también la escritura.
 """
 
 import asyncio
@@ -104,7 +82,7 @@ import sys
 from pathlib import Path
 
 from dotenv import load_dotenv
-from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
+from langchain_core.messages import HumanMessage, SystemMessage
 from mcp import ClientSession
 from mcp.client.stdio import stdio_client
 from pydantic import BaseModel, Field
@@ -118,12 +96,11 @@ if __package__ in (None, ""):
 from agents.llm_factory import build_llm, invoke_structured
 from agents.mcp_tools import (
     REPO_ROOT,
-    invoke_with_retry,
+    FileChange,
+    apply_file_changes,
     mcp_server_params,
-    result_text,
-    summarize_args,
-    tool_to_openai_schema,
-    track_file_change,
+    run_exploration_loop,
+    summarize_exploration,
 )
 from graph.state import EngineeringState, create_initial_state
 from observability.langfuse_config import flush_traces, observe
@@ -131,91 +108,80 @@ from rag.retrievers import get_development_retriever
 
 load_dotenv()
 
-__all__ = ["ImplementationSummary", "developer_agent"]
+__all__ = ["DeveloperPlan", "developer_agent"]
 
-MAX_TOOL_ITERATIONS = 8  # bajado de 12: cada turno es una llamada LLM real, y para
-# los escenarios que pide la consigna del proyecto (explorar 2-3 archivos existentes
-# + crear/editar 3-5 archivos nuevos, ej. Password Recovery, Account Locking) alcanza
-# de sobra; 12 dejaba margen mayor al necesario y multiplicaba el costo del peor caso.
-_TOOL_RESULT_CHAR_LIMIT = 1500  # bajado de 4000: cada resultado de tool queda en el
-# historial y se reenvía COMPLETO en cada turno siguiente — con 4000 chars por
-# resultado (list_files por sí solo ya devuelve ~4000+), para el turno 6 la petición
-# superaba el límite de 8000 tokens/minuto de Groq (413 "Request too large"), sin
-# que reintentar sirviera de nada (no es un 429, la petición nunca iba a entrar).
+MAX_EXPLORATION_TURNS = 5  # cota de la fase de exploración (solo lectura); la
+# escritura ya no tiene ciclo de turnos propio, se ejecuta de una vez.
 
-_SYSTEM_PROMPT = """\
-Eres un ingeniero de software senior de un estudio de ingeniería. Recibes la
+_EXPLORATION_PROMPT = """\
+Eres un ingeniero de software senior de un estudio de ingeniería. Recibís la
 propuesta técnica que ya redactó el arquitecto (stack, componentes,
 decisiones técnicas, plan de alto nivel) más fragmentos reales de las guías
-internas de desarrollo del equipo (estándares de código y clean code). Tu
-trabajo es EJECUTAR ese plan sobre el repositorio real, usando exclusivamente
-las tools disponibles — nunca describas cambios sin aplicarlos.
+internas de desarrollo del equipo.
 
-Las ÚNICAS tools que existen son: list_files, read_file, search_code,
-create_file, update_file. No existe ninguna otra herramienta bajo ningún
-nombre (ej. NO existe "print_tree", "get_tree", "show_structure" ni ninguna
-variante para "ver el árbol de carpetas") — si necesitás la estructura del
-repositorio, list_files() ya te la devuelve completa y recursiva en un solo
-llamado. Si intentás llamar una tool que no está en esta lista exacta, la
-llamada falla y perdés el turno.
+Estás en la FASE DE EXPLORACIÓN, no en la de escritura: en este turno solo
+tenés disponibles tools de LECTURA (list_files, read_file, search_code) — no
+existe create_file ni update_file en esta fase, ni ninguna otra tool bajo
+ningún nombre (ej. NO existe "print_tree" ni variantes; list_files() ya da el
+árbol completo y recursivo en un solo llamado).
 
-Instrucciones:
-- PRIORIZÁ ACTUAR SOBRE EXPLORAR: tenés un número limitado de turnos. Usá como
-  máximo 2-3 llamadas de exploración (list_files/read_file/search_code) antes
-  de tu primer create_file o update_file — lo justo para confirmar rutas y
-  convenciones, no para investigar todo el repositorio a fondo. Es mucho
-  mejor crear un archivo con una primera versión razonable (aunque no sea
-  perfecta) que agotar el presupuesto explorando y no crear nada: un archivo
-  real, aunque tenga fallas, es algo que Security/Testing Agent pueden
-  revisar y que el ciclo de revisión puede corregir después si hace falta;
-  una exploración sin ningún archivo creado no deja nada verificable.
-- Sigue el `plan_alto_nivel` de la arquitectura en orden. Sigue las
-  convenciones reales del proyecto (nombres en español, PascalCase,
-  separación de capas Domain/Application/Infrastructure/Web) según el
-  contexto de las guías de desarrollo provisto abajo, no una convención
-  genérica inventada.
-- Usa create_file solo para archivos nuevos. Usa update_file para editar
-  archivos existentes, copiando el fragmento `old_text` EXACTO devuelto por
-  read_file (mismos espacios e indentación) — si no es exacto, la tool falla
-  sin tocar nada.
-- Sé eficiente: no repitas una tool con los mismos argumentos si ya tienes
-  esa información. Si una llamada falla (ERROR), NUNCA la reintentes con
-  exactamente los mismos argumentos — el resultado va a ser el mismo error de
-  nuevo. Cambiá de estrategia: usá list_files para confirmar el nombre/ruta
-  real antes de reintentar, o segui adelante con otra parte del plan.
-- Si el contexto de las guías no cubre una decisión que necesitas tomar,
-  sigue el patrón de código ya existente en el repositorio real antes que
-  inventar una convención nueva.
-- Cuando el plan esté completo, deja de pedir tools y responde con texto
-  confirmando que terminaste.
-- Responde siempre en español.
+Tu único objetivo es juntar el contexto mínimo necesario para poder proponer
+después los cambios de archivo concretos: confirmá rutas reales, convenciones
+del proyecto (nombres, capas) y, para cualquier archivo que vayas a EDITAR
+(no crear), su contenido EXACTO — vas a necesitar ese texto literal para
+proponer un reemplazo que funcione.
+
+No repitas una tool con los mismos argumentos si ya tenés esa información. Si
+una llamada falla (ERROR), NUNCA la reintentes igual — cambiá de estrategia.
+Cuando tengas contexto suficiente (normalmente alcanza con pocas llamadas),
+dejá de pedir tools y respondé con texto breve confirmando que estás listo.
+Responde siempre en español.
 """
 
-_SUMMARY_PROMPT = """\
-Ya ejecutaste las acciones necesarias sobre el repositorio en el turno
-anterior. Con base en TODO lo que hiciste (no en lo que planeabas hacer),
-redacta un resumen breve (2-4 frases) de qué se implementó y una lista de
-notas relevantes: desviaciones del plan de arquitectura, limitaciones
-conocidas, o seguimientos que el Testing Agent o el Reviewer deberían tener
-en cuenta. Si no hubo desviaciones ni limitaciones, deja la lista de notas
-vacía en vez de inventar una.
+_PLAN_SYSTEM_PROMPT = """\
+Eres un ingeniero de software senior de un estudio de ingeniería. En este
+paso tu único trabajo es análisis y planificación — no ejecutás nada
+directamente, solo respondés con el plan estructurado que se te pide, basado
+en la información que se te da a continuación.
+"""
+
+_PLAN_PROMPT = """\
+Con base en la exploración ya realizada (arriba), generá la lista COMPLETA
+de cambios de archivo necesarios para cumplir el `plan_alto_nivel` de la
+arquitectura — ni más ni menos de lo que hace falta para que el
+requerimiento funcione. Si la especificación es trivial, el plan también
+debe serlo: no agregues archivos, capas ni indirection que el requerimiento
+no pide.
+
+Para cada cambio:
+- accion="crear": `contenido` debe ser el archivo completo y funcional.
+- accion="editar": `old_text` debe ser el fragmento EXACTO que ya se leyó
+  arriba (mismos espacios/indentación) — si el contenido real de ese archivo
+  no aparece en la exploración de arriba, no propongas editarlo (proponé
+  crearlo si corresponde, o dejalo fuera del plan).
+- `razon`: por qué hace falta este cambio puntual.
+
+No propongas cambios sobre archivos que no aparecen en la exploración de
+arriba. `resumen` describe qué se va a implementar y cómo; `notas` son
+desviaciones del plan de arquitectura o limitaciones conocidas (vacío si no
+hay). Responde siempre en español.
 """
 
 
-class ImplementationSummary(BaseModel):
-    """Parte de `implementation` que requiere criterio y redacta el LLM.
+class DeveloperPlan(BaseModel):
+    """Plan estructurado y compacto de cambios de archivo — reemplaza al
+    ciclo abierto de tool-calling para la fase de escritura: el código
+    ejecuta esta lista directo contra el MCP (agents/mcp_tools.py ->
+    apply_file_changes), sin ningún LLM adicional."""
 
-    El resto del dict `implementation` (archivos_creados, archivos_modificados,
-    diff, pasos_seguidos) se calcula en Python a partir de las tools
-    realmente ejecutadas — ver decisiones en el docstring del módulo.
-    """
-
-    resumen: str = Field(
-        ..., description="Resumen breve (2-4 frases) de qué se implementó y cómo."
+    cambios: list[FileChange] = Field(
+        default_factory=list,
+        description="Cambios de archivo necesarios; puede ir vacía si de verdad no hace falta tocar nada.",
     )
+    resumen: str = Field(..., description="Resumen breve (2-4 frases) de qué se va a implementar y cómo.")
     notas: list[str] = Field(
         default_factory=list,
-        description="Desviaciones del plan, limitaciones conocidas o seguimientos sugeridos; vacío si no hubo.",
+        description="Desviaciones del plan de arquitectura o limitaciones conocidas; vacío si no hubo.",
     )
 
 
@@ -238,85 +204,57 @@ def _format_diffs(diffs: dict) -> str:
     return "\n\n".join(diffs[path] for path in sorted(diffs))
 
 
-async def _run_tool_loop(mensaje_usuario: str) -> tuple[list, list[str], list[str], dict, list[str]]:
-    """Ejecuta el ciclo ReAct contra el servidor MCP real y devuelve lo ejecutado.
+async def _plan_and_apply(
+    mensaje_usuario: str,
+) -> tuple[list[str], list[str], dict, list[str], str, list[str]]:
+    """Explora corto, pide un plan estructurado y lo ejecuta sin LLM adicional.
 
-    Devuelve (messages, archivos_creados, archivos_modificados, diffs, pasos_seguidos).
+    Devuelve (archivos_creados, archivos_modificados, diffs, pasos, resumen, notas).
     """
     async with stdio_client(mcp_server_params()) as (read, write):
         async with ClientSession(read, write) as session:
             await session.initialize()
-            tools_result = await session.list_tools()
-            tool_schemas = [tool_to_openai_schema(t) for t in tools_result.tools]
+            llm = build_llm()
 
-            llm_with_tools = build_llm().bind_tools(tool_schemas)
-            messages: list = [
-                SystemMessage(content=_SYSTEM_PROMPT),
-                HumanMessage(content=mensaje_usuario),
-            ]
+            messages = await run_exploration_loop(
+                session, llm, _EXPLORATION_PROMPT, mensaje_usuario,
+                MAX_EXPLORATION_TURNS, "Developer Agent",
+            )
 
-            archivos_creados: set = set()
-            archivos_modificados: set = set()
-            diffs: dict = {}
-            pasos: list[str] = []
-
-            for turno in range(1, MAX_TOOL_ITERATIONS + 1):
-                print(f"      [Developer Agent] turno {turno}/{MAX_TOOL_ITERATIONS}: consultando al LLM...")
-                # asyncio.to_thread: libera el event loop mientras el LLM responde, para
-                # que anyio/MCP puedan seguir sirviendo el subproceso en paralelo.
-                # invoke_with_retry (agents/mcp_tools.py): reintenta ante 429 (rate limit)
-                # sobre el MISMO cliente — la causa real confirmada de "unhandled errors in
-                # a TaskGroup": este LLM se bindea una sola vez al principio del ciclo (ver
-                # decisión abajo) y, a diferencia de invoke_structured(), no tenía ningún
-                # reintento propio — un 429 crudo del proveedor reventaba sin manejo.
-                try:
-                    ai_message = await asyncio.to_thread(invoke_with_retry, llm_with_tools, messages)
-                except Exception as error:
-                    # Cualquier error del LLM que invoke_with_retry no pudo resolver
-                    # (ya sea porque no es un 429, o porque el 429 persistió tras los
-                    # reintentos) NO debe tumbar todo el pipeline — se corta el ciclo
-                    # acá mismo, igual que cuando se agota MAX_TOOL_ITERATIONS, y se
-                    # sigue al resumen final con lo que se alcanzó a hacer. Visto en
-                    # producción: 429 (rate limit), 413 (petición muy grande), 400
-                    # (el modelo alucinó una tool que no existe) — la causa cambia,
-                    # pero ninguna amerita perder el progreso ya hecho.
-                    print(f"      [Developer Agent] ALERTA - error irrecuperable del LLM en el turno {turno}, cortando el ciclo: {error}")
-                    pasos.append(f"⚠ el ciclo se cortó en el turno {turno} por un error del LLM: {error}")
-                    break
-                messages.append(ai_message)
-                if not ai_message.tool_calls:
-                    print("      [Developer Agent] el modelo no pidió más tools; ciclo terminado.")
-                    break
-                for tool_call in ai_message.tool_calls:
-                    args_resumen = summarize_args(tool_call.get("args", {}))
-                    print(f"      [Developer Agent] -> {tool_call['name']}({args_resumen})")
-                    result = await session.call_tool(
-                        tool_call["name"], tool_call.get("args", {})
-                    )
-                    text = result_text(result)
-                    is_error = bool(getattr(result, "is_error", False))
-                    change = track_file_change(tool_call, text, is_error)
-                    if change is not None:
-                        file_path, bucket, diff = change
-                        diffs[file_path] = diff
-                        (archivos_creados if bucket == "creado" else archivos_modificados).add(file_path)
-                    estado = "ERROR" if is_error else "OK"
-                    print(f"      [Developer Agent]    {estado}")
-                    pasos.append(
-                        f"{tool_call['name']}({summarize_args(tool_call.get('args', {}))}) -> {estado}"
-                    )
-                    messages.append(
-                        ToolMessage(
-                            content=text[:_TOOL_RESULT_CHAR_LIMIT],
-                            tool_call_id=tool_call["id"],
-                        )
-                    )
-            else:
-                pasos.append(
-                    f"⚠ se alcanzó MAX_TOOL_ITERATIONS={MAX_TOOL_ITERATIONS} sin que el modelo terminara por su cuenta."
+            print("      [Developer Agent] generando plan de cambios...")
+            resumen_exploracion = summarize_exploration(messages)
+            plan_context = (
+                f"Requerimiento original:\n{mensaje_usuario}\n\n"
+                f"--- Exploración ya realizada ---\n{resumen_exploracion}\n\n{_PLAN_PROMPT}"
+            )
+            try:
+                # Contexto NUEVO de 2 mensajes (System + Human), sin los
+                # AIMessage con tool_calls de la exploración — ver la decisión
+                # en agents/mcp_tools.py::summarize_exploration.
+                plan = invoke_structured(
+                    DeveloperPlan,
+                    [SystemMessage(content=_PLAN_SYSTEM_PROMPT), HumanMessage(content=plan_context)],
                 )
+            except Exception as error:
+                # Ningún proveedor logró devolver el plan (los 4 fallaron, o el
+                # único configurado falló) — no debe tumbar todo el pipeline
+                # por esto: se sigue con un plan vacío y una nota explícita,
+                # mismo criterio que el resto del sistema ante un error del
+                # LLM que no se puede resolver.
+                print(f"      [Developer Agent] ALERTA - no se pudo generar el plan de cambios: {error}")
+                return [], [], {}, [f"⚠ no se pudo generar el plan de cambios: {error}"], (
+                    "No se generó ninguna implementación: todos los proveedores LLM "
+                    "fallaron al pedir el plan de cambios."
+                ), []
+            print(f"      [Developer Agent] plan con {len(plan.cambios)} cambio(s); ejecutando...")
 
-            return messages, sorted(archivos_creados), sorted(archivos_modificados), diffs, pasos
+            archivos_creados, archivos_modificados, diffs, pasos = await apply_file_changes(
+                session, plan.cambios, "Developer Agent"
+            )
+            if not plan.cambios:
+                pasos.append("⚠ el plan no propuso ningún cambio de archivo.")
+
+            return archivos_creados, archivos_modificados, diffs, pasos, plan.resumen, plan.notas
 
 
 @observe(name="developer_agent")
@@ -356,17 +294,13 @@ def developer_agent(state: EngineeringState) -> dict:
         f"{contexto}"
     )
 
-    messages, archivos_creados, archivos_modificados, diffs, pasos = asyncio.run(
-        _run_tool_loop(mensaje_usuario)
-    )
-
-    summary = invoke_structured(
-        ImplementationSummary, messages + [HumanMessage(content=_SUMMARY_PROMPT)]
+    archivos_creados, archivos_modificados, diffs, pasos, resumen, notas = asyncio.run(
+        _plan_and_apply(mensaje_usuario)
     )
 
     implementation = {
-        "resumen": summary.resumen,
-        "notas": summary.notas,
+        "resumen": resumen,
+        "notas": notas,
         "archivos_creados": archivos_creados,
         "archivos_modificados": archivos_modificados,
         "diff": _format_diffs(diffs),

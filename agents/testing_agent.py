@@ -3,10 +3,10 @@
 Qué hace:
     Lee la `implementation` que dejó el Developer Agent (y la especificación
     funcional, para los criterios de aceptación), consulta el RAG de testing
-    (knowledge/testing/testing-strategy.md) y ejecuta un ciclo de tool-calling
-    contra el servidor MCP propio para explorar los proyectos de test del
-    repositorio real, opcionalmente agregar casos de prueba que falten, y
-    correr `run_tests` — devolviendo pass/fail real, no inventado.
+    (knowledge/testing/testing-strategy.md) y en dos fases contra el servidor
+    MCP real: (1) explora los proyectos de test existentes y (2) ejecuta un
+    plan estructurado y compacto (qué casos agregar, qué `run_tests` correr)
+    — devolviendo pass/fail real, no inventado.
 
 Responsabilidad dentro del sistema:
     Verifica objetivamente que la implementación cumple lo esperado y reporta
@@ -15,62 +15,49 @@ Responsabilidad dentro del sistema:
     Security -> Testing -> Reviewer, ver README.md).
 
 Decisiones (Fase 6 de Guia_Construccion.md, agente 5/6):
-    - Nueva dependencia: la tool MCP `run_tests`, agregada a
-      mcp_server/server.py en este mismo paso (no existía — su docstring
-      decía explícitamente "run_tests y get_diff se agregarán después").
-      Corre `dotnet test` real vía subprocess y parsea las líneas de resumen
-      que dotnet imprime por proyecto de test.
-    - Reutiliza el mismo patrón de ciclo ReAct que developer_agent.py
-      (agente 4/6): conexión MCP por protocolo real, tools bindeadas al LLM
-      sin adapter externo. La plomería común (conectar, convertir tools,
-      trackear create_file/update_file) ya vive en agents/mcp_tools.py,
-      extraída precisamente para este segundo caso de uso.
+    - Nueva dependencia: la tool MCP `run_tests` (mcp_server/server.py). Corre
+      `dotnet test` real vía subprocess y parsea las líneas de resumen que
+      dotnet imprime por proyecto de test.
     - Depende de `implementation` (obligatoria); `specification` y
-      `security_review` son opcionales, como contexto adicional. A
-      diferencia de developer_agent.py (que corre ANTES que Security y por
-      eso no puede depender de `security_review`), el pipeline real del
-      grafo es Product -> Architect -> Developer -> Security -> Testing ->
-      Reviewer (ver README.md): cuando Testing corre, Security ya corrió, así
-      que `security_review` normalmente sí existe. Se usa para priorizar los
-      "casos de abuso" que `knowledge/testing/testing-strategy.md` pide
-      explícitamente cubrir con test (auto-aprobación, IDOR, forced
-      browsing...), pero se lee con `state.get(...)` y no con `state[...]`
-      para que el agente siga siendo probable de forma aislada (Fase 6) con
-      solo una `implementation` de prueba, sin necesitar simular también un
-      `security_review`.
-    - `passed`/`failed`/`skipped`/`total`/`aprobado` se calculan en Python a
-      partir de los resultados REALES de cada llamada a `run_tests` que el
-      LLM ejecutó — nunca se le pide al LLM que reporte estos números de
-      memoria. Mismo principio que `archivos_creados`/`archivos_modificados`
-      en developer_agent.py, llevado a la parte más crítica de este agente:
-      un número de tests pasados/fallidos inventado por el LLM sería
-      particularmente engañoso para el Reviewer, que lo usa como señal
-      objetiva.
-    - El prompt exige explícitamente invocar `run_tests` al menos una vez
-      antes de terminar — a diferencia de developer_agent.py, donde el
-      objetivo (crear/editar archivos) es visible en pasos_seguidos aunque el
-      LLM se distraiga, acá un ciclo que solo explora sin nunca ejecutar
-      `run_tests` produciría un reporte con `aprobado=False` y cero tests
-      corridos, que es indistinguible de "no se pudo verificar nada" — hay
-      que dejarlo así de explícito en las instrucciones para minimizar que
-      pase con un modelo gratuito.
+      `security_review` son opcionales, como contexto adicional.
+    - REDISEÑO: mismo patrón que developer_agent.py — "planificar" separado
+      de "ejecutar" (agents/mcp_tools.py -> run_exploration_loop /
+      apply_file_changes), en vez de un único ciclo ReAct abierto que
+      mezclaba exploración, creación de casos nuevos y `run_tests` en la
+      misma conversación creciente (causa real de 413 "Request too large" y
+      de que el modelo alucinara tools a mitad de una conversación larga).
+      Ahora:
+        1. run_exploration_loop() explora CORTO (MAX_EXPLORATION_TURNS) con
+           SOLO tools de lectura, para encontrar el proyecto de test real.
+        2. invoke_structured() pide un `TestingPlan` compacto: qué casos
+           nuevos agregar (si hace falta) y qué `run_tests` correr.
+        3. El código ejecuta ese plan: primero los casos nuevos
+           (apply_file_changes, sin LLM), después cada `run_tests` del plan,
+           iterando en Python — sin ninguna llamada LLM adicional.
+    - `run_tests_calls` del plan SIEMPRE incluye al menos una corrida real:
+      si el LLM no propuso ninguna (a pesar de que el prompt lo exige), el
+      código agrega una corrida por defecto sobre la raíz del repo — la
+      obligación de correr tests de verdad queda garantizada por CÓDIGO, no
+      solo por texto del prompt, mismo principio que ya aplica todo el resto
+      del sistema ("no confiar en la memoria/obediencia del modelo para
+      hechos verificables").
+    - `passed`/`failed`/`skipped`/`total`/`aprobado` se calculan en Python
+      (`_aggregate_run_tests`, sin cambios) a partir de los resultados REALES
+      de cada `run_tests` — nunca se le pide al LLM que los reporte de
+      memoria.
     - `aprobado` exige AL MENOS una llamada real a `run_tests`, cero
       `failed`, `total > 0` y ningún timeout: un `total == 0` (no se
       encontraron/corrieron tests) NO cuenta como aprobado, aunque
       `failed == 0` — "no hay tests que fallen" no es lo mismo que "los
       tests pasan".
-    - Cliente LLM vía agents/llm_factory.py (build_llm), igual que los
-      cuatro agentes anteriores.
-    - print() por turno y por tool call dentro del ciclo ReAct: mismo motivo
-      que developer_agent.py — sin esto, la terminal queda en silencio total
-      durante los ~12 turnos posibles de este agente.
-    - asyncio.to_thread() + invoke_with_retry() (agents/mcp_tools.py) en la
-      llamada al LLM del ciclo, más un try/except alrededor que corta el
-      ciclo (sin tumbar el pipeline) ante cualquier error que
-      invoke_with_retry no pudo resolver (429 persistente, 413 "Request too
-      large", 400 por tool alucinada) — mismo fix y mismas causas reales
-      confirmadas que developer_agent.py; ver el docstring de ese archivo
-      para el detalle completo del diagnóstico.
+    - `casos_generados` ahora es directamente `archivos_creados` (los
+      archivos que `apply_file_changes()` realmente creó) en vez de una
+      lista redactada por el LLM en una llamada de resumen aparte — mismo
+      principio de no confiar en la memoria del modelo, llevado un paso más
+      allá: ni siquiera se le pregunta, se usa el hecho verificable directo.
+    - Cliente LLM vía agents/llm_factory.py (build_llm/invoke_structured).
+    - print() por fase/turno/cambio: mismo motivo que developer_agent.py —
+      sin esto, la terminal queda en silencio total durante la corrida.
 """
 
 import asyncio
@@ -80,7 +67,7 @@ import sys
 from pathlib import Path
 
 from dotenv import load_dotenv
-from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
+from langchain_core.messages import HumanMessage, SystemMessage
 from mcp import ClientSession
 from mcp.client.stdio import stdio_client
 from pydantic import BaseModel, Field
@@ -94,12 +81,12 @@ if __package__ in (None, ""):
 from agents.llm_factory import build_llm, invoke_structured
 from agents.mcp_tools import (
     REPO_ROOT,
-    invoke_with_retry,
+    FileChange,
+    apply_file_changes,
     mcp_server_params,
     result_text,
-    summarize_args,
-    tool_to_openai_schema,
-    track_file_change,
+    run_exploration_loop,
+    summarize_exploration,
 )
 from graph.state import EngineeringState, create_initial_state
 from observability.langfuse_config import flush_traces, observe
@@ -107,93 +94,91 @@ from rag.retrievers import get_testing_retriever
 
 load_dotenv()
 
-__all__ = ["TestingSummary", "testing_agent"]
+__all__ = ["TestingPlan", "testing_agent"]
 
-MAX_TOOL_ITERATIONS = 8  # bajado de 12, mismo motivo que developer_agent.py: cada
-# turno es una llamada LLM real; explorar los proyectos de test existentes + correr
-# run_tests (obligatorio) + opcionalmente agregar 1-2 casos alcanza con este límite.
-_TOOL_RESULT_CHAR_LIMIT = 1500  # bajado de 4000, mismo motivo que developer_agent.py:
-# evitar el 413 "Request too large" de Groq (límite de 8000 tokens/minuto) cuando el
-# historial acumulado de varios turnos supera lo que una sola petición puede pesar.
+MAX_EXPLORATION_TURNS = 5  # cota de la fase de exploración (solo lectura);
+# la ejecución (casos nuevos + run_tests) no tiene ciclo de turnos propio.
 
-_SYSTEM_PROMPT = """\
-Eres un QA engineer senior de un estudio de ingeniería. Recibes lo que el
+_EXPLORATION_PROMPT = """\
+Eres un QA engineer senior de un estudio de ingeniería. Recibís lo que el
 Developer Agent implementó (archivos creados/modificados, resumen), los
 criterios de aceptación de la especificación original, y fragmentos reales
-de la estrategia de testing del equipo. Tu trabajo es verificar de forma
-OBJETIVA que la implementación funciona, ejecutando pruebas reales — nunca
-afirmes un resultado de pruebas sin haberlo corrido.
+de la estrategia de testing del equipo.
 
-Las ÚNICAS tools que existen son: list_files, read_file, search_code,
-create_file, update_file, run_tests. No existe ninguna otra herramienta bajo
-ningún nombre (ej. NO existe "print_tree", "get_tree", "show_structure" ni
-ninguna variante para "ver el árbol de carpetas") — si necesitás la
-estructura del repositorio, list_files() ya te la devuelve completa y
-recursiva en un solo llamado. Si intentás llamar una tool que no está en
-esta lista exacta, la llamada falla y perdés el turno.
+Estás en la FASE DE EXPLORACIÓN, no en la de ejecución: en este turno solo
+tenés disponibles tools de LECTURA (list_files, read_file, search_code) — no
+existe create_file, update_file ni run_tests en esta fase, ni ninguna otra
+tool bajo ningún nombre (ej. NO existe "print_tree" ni variantes; list_files()
+ya da el árbol completo y recursivo en un solo llamado).
 
-Instrucciones:
-- Explora el repositorio (list_files, read_file, search_code) para encontrar
-  los proyectos de test relacionados con los archivos que tocó el Developer
-  Agent — normalmente un proyecto `*.Tests` por cada capa (ver la estrategia
-  de testing provista abajo).
-- Si se te provee una revisión de seguridad con hallazgos, priorizá verificar
-  con test los casos de abuso relacionados (auto-aprobación, IDOR, forced
-  browsing, escalación de privilegios) antes que casos genéricos — son los
-  que la estrategia de testing marca como obligatorios.
-- Si detectás un criterio de aceptación relevante que claramente no tiene
-  cobertura de test existente, podés agregar un caso de prueba nuevo con
-  create_file/update_file, siguiendo la pirámide de pruebas y las
-  convenciones del equipo (nivel correcto: unitaria/integración/E2E). No es
-  obligatorio agregar tests nuevos si lo existente ya cubre lo relevante.
-- Es OBLIGATORIO invocar la tool run_tests al menos una vez antes de
-  terminar, apuntando al proyecto o carpeta de test relevante (o a la raíz
-  si no estás seguro). No has terminado tu trabajo hasta que hayas corrido
-  run_tests de verdad y visto un resultado real.
-- Sé eficiente: tenés un número limitado de acciones. Explorá lo mínimo
-  necesario para encontrar el proyecto de test correcto. Si una llamada falla
-  (ERROR), NUNCA la reintentes con exactamente los mismos argumentos — el
-  resultado va a ser el mismo error de nuevo. Cambiá de estrategia: usá
-  list_files para confirmar el nombre/ruta real antes de reintentar.
-- Cuando termines, deja de pedir tools y responde con texto confirmando que
-  terminaste.
-- Responde siempre en español.
+Tu único objetivo es encontrar el/los proyecto(s) de test reales relacionados
+con lo que tocó el Developer Agent (normalmente un proyecto `*.Tests` por
+capa, ver la estrategia de testing provista abajo) y, si vas a proponer casos
+nuevos, el contenido EXACTO de los archivos que vayas a editar.
+
+No repitas una tool con los mismos argumentos si ya tenés esa información. Si
+una llamada falla (ERROR), NUNCA la reintentes igual — cambiá de estrategia.
+Cuando tengas contexto suficiente, dejá de pedir tools y respondé con texto
+breve confirmando que estás listo. Responde siempre en español.
 """
 
-_SUMMARY_PROMPT = """\
-Ya ejecutaste las acciones necesarias sobre el repositorio en el turno
-anterior, incluyendo al menos una corrida real de run_tests. Con base en
-TODO lo que hiciste (no en lo que planeabas hacer), redacta un resumen breve
-(2-4 frases) de qué se verificó, qué casos de prueba nuevos agregaste (si
-hubo) y qué hallazgos relevantes surgieron (criterios de aceptación sin
-cobertura, fallos inesperados). Si no hubo casos nuevos ni hallazgos, deja
-esas listas vacías en vez de inventar contenido.
+_PLAN_SYSTEM_PROMPT = """\
+Eres un QA engineer senior de un estudio de ingeniería. En este paso tu
+único trabajo es análisis y planificación — no ejecutás nada directamente,
+solo respondés con el plan estructurado que se te pide, basado en la
+información que se te da a continuación.
+"""
+
+_PLAN_PROMPT = """\
+Con base en la exploración ya realizada (arriba), generá el plan de verificación:
+
+- `run_tests_calls`: AL MENOS una corrida real, apuntando al proyecto o
+  carpeta de test relevante que encontraste explorando (o a la raíz si no
+  estás seguro). Esto es obligatorio.
+- `casos_a_agregar`: SOLO si detectaste un criterio de aceptación relevante
+  sin cobertura de test existente — seguí la pirámide de pruebas y las
+  convenciones del equipo. Si lo existente ya cubre lo relevante, dejalo
+  vacío; no agregues casos por agregar.
+- Si se te proveyeron hallazgos de seguridad, priorizá que los casos que
+  agregues (o los `run_tests_calls` que elijas) cubran esos casos de abuso
+  (auto-aprobación, IDOR, forced browsing, escalación de privilegios) antes
+  que casos genéricos.
+
+Para cada entrada de `casos_a_agregar` (mismo formato que un cambio de
+archivo): accion="crear" con `contenido` completo, o accion="editar" con
+`old_text` EXACTO (el que vos mismo leíste) y `new_text`.
+
+`resumen` describe qué vas a verificar y cómo; `hallazgos` son criterios sin
+cobertura o fallos relevantes a destacar (vacío si no hay); `notas` son
+limitaciones conocidas o seguimientos sugeridos (vacío si no hay).
 """
 
 
-class TestingSummary(BaseModel):
-    """Parte de `test_results` que requiere criterio y redacta el LLM.
+class RunTestsCall(BaseModel):
+    subpath: str = Field(default="", description="Carpeta/proyecto de test a correr; vacío para la raíz del repo.")
+    filter: str = Field(default="", description="Filtro opcional de dotnet test; vacío para correr todos los tests del subpath.")
 
-    El resto del dict (passed/failed/skipped/total/aprobado,
-    archivos_creados, archivos_modificados, pasos_seguidos) se calcula en
-    Python a partir de las tools realmente ejecutadas — ver decisiones en el
-    docstring del módulo.
-    """
 
-    resumen: str = Field(
-        ..., description="Resumen breve (2-4 frases) de qué se verificó y cómo."
-    )
-    casos_generados: list[str] = Field(
+class TestingPlan(BaseModel):
+    """Plan estructurado y compacto de verificación — reemplaza al ciclo
+    abierto de tool-calling: el código ejecuta esta lista directo contra el
+    MCP (casos nuevos + run_tests), sin ningún LLM adicional."""
+
+    casos_a_agregar: list[FileChange] = Field(
         default_factory=list,
-        description="Casos de prueba nuevos que agregaste; vacío si solo ejecutaste tests existentes.",
+        description="Casos de prueba nuevos a crear/editar; vacío si lo existente ya cubre lo relevante.",
     )
+    run_tests_calls: list[RunTestsCall] = Field(
+        default_factory=list,
+        description="Corridas de run_tests a ejecutar; el código garantiza al menos una aunque esta lista venga vacía.",
+    )
+    resumen: str = Field(..., description="Resumen breve (2-4 frases) de qué se va a verificar y cómo.")
     hallazgos: list[str] = Field(
         default_factory=list,
-        description="Criterios de aceptación sin cobertura de test, o fallos relevantes a destacar; vacío si no hubo.",
+        description="Criterios de aceptación sin cobertura, o fallos relevantes a destacar; vacío si no hubo.",
     )
     notas: list[str] = Field(
-        default_factory=list,
-        description="Limitaciones conocidas o seguimientos sugeridos; vacío si no hubo.",
+        default_factory=list, description="Limitaciones conocidas o seguimientos sugeridos; vacío si no hubo."
     )
 
 
@@ -208,90 +193,6 @@ def _format_context(docs) -> str:
         etiqueta = f"[{fuente}{' - ' + header if header else ''}]"
         partes.append(f"{etiqueta}\n{doc.page_content}")
     return "\n\n".join(partes)
-
-
-async def _run_tool_loop(
-    mensaje_usuario: str,
-) -> tuple[list, list[str], list[str], list[dict], list[str]]:
-    """Ejecuta el ciclo ReAct contra el servidor MCP real y devuelve lo ejecutado.
-
-    Devuelve (messages, archivos_creados, archivos_modificados, run_tests_calls, pasos_seguidos).
-    run_tests_calls es la lista de resultados (dict) de cada llamada real y
-    exitosa a la tool run_tests, en el orden en que se ejecutaron.
-    """
-    async with stdio_client(mcp_server_params()) as (read, write):
-        async with ClientSession(read, write) as session:
-            await session.initialize()
-            tools_result = await session.list_tools()
-            tool_schemas = [tool_to_openai_schema(t) for t in tools_result.tools]
-
-            llm_with_tools = build_llm().bind_tools(tool_schemas)
-            messages: list = [
-                SystemMessage(content=_SYSTEM_PROMPT),
-                HumanMessage(content=mensaje_usuario),
-            ]
-
-            archivos_creados: set = set()
-            archivos_modificados: set = set()
-            run_tests_calls: list[dict] = []
-            pasos: list[str] = []
-
-            for turno in range(1, MAX_TOOL_ITERATIONS + 1):
-                print(f"      [Testing Agent] turno {turno}/{MAX_TOOL_ITERATIONS}: consultando al LLM...")
-                # asyncio.to_thread + invoke_with_retry (agents/mcp_tools.py): ver la
-                # decisión detallada en agents/developer_agent.py — reintenta ante 429
-                # (rate limit) sobre el mismo cliente, sin cambiar de proveedor a mitad
-                # de conversación.
-                try:
-                    ai_message = await asyncio.to_thread(invoke_with_retry, llm_with_tools, messages)
-                except Exception as error:
-                    # Ver la decisión detallada en agents/developer_agent.py: cualquier
-                    # error del LLM que invoke_with_retry no pudo resolver corta el
-                    # ciclo acá (igual que MAX_TOOL_ITERATIONS agotado) en vez de tumbar
-                    # todo el pipeline — se sigue al resumen final con lo ya logrado.
-                    print(f"      [Testing Agent] ALERTA - error irrecuperable del LLM en el turno {turno}, cortando el ciclo: {error}")
-                    pasos.append(f"⚠ el ciclo se cortó en el turno {turno} por un error del LLM: {error}")
-                    break
-                messages.append(ai_message)
-                if not ai_message.tool_calls:
-                    print("      [Testing Agent] el modelo no pidió más tools; ciclo terminado.")
-                    break
-                for tool_call in ai_message.tool_calls:
-                    args_resumen = summarize_args(tool_call.get("args", {}))
-                    print(f"      [Testing Agent] -> {tool_call['name']}({args_resumen})")
-                    result = await session.call_tool(
-                        tool_call["name"], tool_call.get("args", {})
-                    )
-                    text = result_text(result)
-                    is_error = bool(getattr(result, "is_error", False))
-
-                    change = track_file_change(tool_call, text, is_error)
-                    if change is not None:
-                        file_path, bucket, _diff = change
-                        (archivos_creados if bucket == "creado" else archivos_modificados).add(file_path)
-                    if tool_call["name"] == "run_tests" and not is_error:
-                        try:
-                            run_tests_calls.append(json.loads(text))
-                        except json.JSONDecodeError:
-                            pass
-
-                    estado = "ERROR" if is_error else "OK"
-                    print(f"      [Testing Agent]    {estado}")
-                    pasos.append(
-                        f"{tool_call['name']}({summarize_args(tool_call.get('args', {}))}) -> {estado}"
-                    )
-                    messages.append(
-                        ToolMessage(
-                            content=text[:_TOOL_RESULT_CHAR_LIMIT],
-                            tool_call_id=tool_call["id"],
-                        )
-                    )
-            else:
-                pasos.append(
-                    f"⚠ se alcanzó MAX_TOOL_ITERATIONS={MAX_TOOL_ITERATIONS} sin que el modelo terminara por su cuenta."
-                )
-
-            return messages, sorted(archivos_creados), sorted(archivos_modificados), run_tests_calls, pasos
 
 
 def _aggregate_run_tests(run_tests_calls: list[dict]) -> dict:
@@ -312,6 +213,85 @@ def _aggregate_run_tests(run_tests_calls: list[dict]) -> dict:
 
     aprobado = bool(run_tests_calls) and totals["failed"] == 0 and totals["total"] > 0 and not algun_timeout
     return {**totals, "aprobado": aprobado, "comandos_ejecutados": comandos}
+
+
+async def _plan_and_apply(
+    mensaje_usuario: str,
+) -> tuple[list[str], list[str], list[dict], list[str], str, list[str], list[str]]:
+    """Explora corto, pide un plan estructurado y lo ejecuta sin LLM adicional.
+
+    Devuelve (archivos_creados, archivos_modificados, run_tests_calls, pasos, resumen, hallazgos, notas).
+    """
+    async with stdio_client(mcp_server_params()) as (read, write):
+        async with ClientSession(read, write) as session:
+            await session.initialize()
+            llm = build_llm()
+
+            messages = await run_exploration_loop(
+                session, llm, _EXPLORATION_PROMPT, mensaje_usuario,
+                MAX_EXPLORATION_TURNS, "Testing Agent",
+            )
+
+            print("      [Testing Agent] generando plan de verificación...")
+            resumen_exploracion = summarize_exploration(messages)
+            plan_context = (
+                f"Contexto original:\n{mensaje_usuario}\n\n"
+                f"--- Exploración ya realizada ---\n{resumen_exploracion}\n\n{_PLAN_PROMPT}"
+            )
+            try:
+                # Contexto NUEVO de 2 mensajes (System + Human), sin los
+                # AIMessage con tool_calls de la exploración — ver la decisión
+                # en agents/mcp_tools.py::summarize_exploration.
+                plan = invoke_structured(
+                    TestingPlan,
+                    [SystemMessage(content=_PLAN_SYSTEM_PROMPT), HumanMessage(content=plan_context)],
+                )
+            except Exception as error:
+                # Mismo criterio que developer_agent.py: si ningún proveedor
+                # logró devolver el plan, no debe tumbar todo el pipeline —
+                # se sigue con un resultado vacío y una nota explícita.
+                print(f"      [Testing Agent] ALERTA - no se pudo generar el plan de verificación: {error}")
+                return [], [], [], [f"⚠ no se pudo generar el plan de verificación: {error}"], (
+                    "No se pudo verificar nada: todos los proveedores LLM fallaron "
+                    "al pedir el plan de verificación."
+                ), [], []
+
+            corridas = plan.run_tests_calls or [RunTestsCall(subpath="", filter="")]
+            print(
+                f"      [Testing Agent] plan con {len(plan.casos_a_agregar)} caso(s) nuevo(s) y "
+                f"{len(corridas)} corrida(s) de run_tests; ejecutando..."
+            )
+
+            archivos_creados, archivos_modificados, _diffs, pasos = await apply_file_changes(
+                session, plan.casos_a_agregar, "Testing Agent"
+            )
+
+            run_tests_calls: list[dict] = []
+            for llamada in corridas:
+                print(f"      [Testing Agent] -> run_tests(subpath={llamada.subpath!r}, filter={llamada.filter!r})")
+                result = await session.call_tool(
+                    "run_tests", {"subpath": llamada.subpath, "filter": llamada.filter}
+                )
+                text = result_text(result)
+                is_error = bool(getattr(result, "is_error", False))
+                estado = "ERROR" if is_error else "OK"
+                print(f"      [Testing Agent]    {estado}")
+                pasos.append(f"run_tests(subpath={llamada.subpath!r}) -> {estado}")
+                if not is_error:
+                    try:
+                        run_tests_calls.append(json.loads(text))
+                    except json.JSONDecodeError:
+                        pass
+
+            return (
+                archivos_creados,
+                archivos_modificados,
+                run_tests_calls,
+                pasos,
+                plan.resumen,
+                plan.hallazgos,
+                plan.notas,
+            )
 
 
 @observe(name="testing_agent")
@@ -356,19 +336,15 @@ def testing_agent(state: EngineeringState) -> dict:
         f"{contexto}"
     )
 
-    messages, archivos_creados, archivos_modificados, run_tests_calls, pasos = asyncio.run(
-        _run_tool_loop(mensaje_usuario)
-    )
-
-    summary = invoke_structured(
-        TestingSummary, messages + [HumanMessage(content=_SUMMARY_PROMPT)]
+    archivos_creados, archivos_modificados, run_tests_calls, pasos, resumen, hallazgos, notas = asyncio.run(
+        _plan_and_apply(mensaje_usuario)
     )
 
     test_results = {
-        "resumen": summary.resumen,
-        "casos_generados": summary.casos_generados,
-        "hallazgos": summary.hallazgos,
-        "notas": summary.notas,
+        "resumen": resumen,
+        "casos_generados": archivos_creados,
+        "hallazgos": hallazgos,
+        "notas": notas,
         **_aggregate_run_tests(run_tests_calls),
         "archivos_creados": archivos_creados,
         "archivos_modificados": archivos_modificados,

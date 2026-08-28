@@ -36,6 +36,8 @@ Decisiones (Fase 8 de Guia_Construccion.md):
       "nunca se le piden de memoria al LLM" (ver AGENTS.md).
 """
 
+import asyncio
+
 import pytest
 
 import agents.architect_agent as architect_mod
@@ -45,6 +47,8 @@ import agents.security_agent as security_mod
 from agents.architect_agent import ArchitectureProposal, TechnicalDecision, architect_agent
 from agents.developer_agent import developer_agent
 from agents.mcp_tools import (
+    FileChange,
+    apply_file_changes,
     invoke_with_retry,
     result_text,
     summarize_args,
@@ -334,6 +338,65 @@ def test_invoke_with_retry_lanza_si_se_agotan_los_intentos_con_429_persistente(m
 
     with pytest.raises(_FakeStatusError):
         invoke_with_retry(FakeLLM(), ["mensaje"], max_intentos=2)
+
+
+# ---------- apply_file_changes (agents/mcp_tools.py) — sesión MCP falsa, sin subproceso ----------
+
+
+class _FakeToolResult:
+    def __init__(self, text: str, is_error: bool = False):
+        self.content = [type("Chunk", (), {"text": text})()]
+        self.is_error = is_error
+
+
+class _FakeSession:
+    """Sesión MCP falsa: registra las llamadas y devuelve respuestas canned,
+    sin levantar ningún subproceso real ni gastar tokens."""
+
+    def __init__(self, respuestas: dict | None = None):
+        self.llamadas: list[tuple[str, dict]] = []
+        self._respuestas = respuestas or {}
+
+    async def call_tool(self, name: str, args: dict):
+        self.llamadas.append((name, args))
+        texto, is_error = self._respuestas.get(name, ("ok", False))
+        return _FakeToolResult(texto, is_error)
+
+
+def test_apply_file_changes_crea_y_edita_sin_llm():
+    fake = _FakeSession()
+    cambios = [
+        FileChange(file_path="a.cs", accion="crear", contenido="hola mundo", razon="archivo nuevo"),
+        FileChange(file_path="b.cs", accion="editar", old_text="x", new_text="y", razon="fix"),
+    ]
+
+    creados, modificados, diffs, pasos = asyncio.run(apply_file_changes(fake, cambios, "Test"))
+
+    assert creados == ["a.cs"]
+    assert modificados == ["b.cs"]
+    assert set(diffs) == {"a.cs", "b.cs"}
+    assert len(pasos) == 2
+    assert fake.llamadas[0] == ("create_file", {"file_path": "a.cs", "content": "hola mundo"})
+    assert fake.llamadas[1] == ("update_file", {"file_path": "b.cs", "old_text": "x", "new_text": "y"})
+
+
+def test_apply_file_changes_no_cuenta_los_cambios_que_fallan():
+    fake = _FakeSession(respuestas={"create_file": ("ya existe", True)})
+    cambios = [FileChange(file_path="a.cs", accion="crear", contenido="x", razon="r")]
+
+    creados, modificados, diffs, pasos = asyncio.run(apply_file_changes(fake, cambios, "Test"))
+
+    assert creados == []
+    assert modificados == []
+    assert diffs == {}
+    assert "ERROR" in pasos[0]
+
+
+def test_apply_file_changes_lista_vacia_no_llama_a_nada():
+    fake = _FakeSession()
+    creados, modificados, diffs, pasos = asyncio.run(apply_file_changes(fake, [], "Test"))
+    assert (creados, modificados, diffs, pasos) == ([], [], {}, [])
+    assert fake.llamadas == []
 
 
 # ---------- reviewer_agent ----------

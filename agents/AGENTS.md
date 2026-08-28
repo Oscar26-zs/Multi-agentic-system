@@ -273,6 +273,8 @@ Al correrse directamente (`python agents/security_agent.py`), el agente se prueb
 
 ## 4. Developer Agent (`agents/developer_agent.py`)
 
+> **Actualización (rediseño "planificar" separado de "ejecutar"):** la descripción de abajo documenta el diseño ORIGINAL (un único ciclo ReAct abierto que exploraba y escribía en la misma conversación). Se reemplazó porque ese diseño hacía crecer el historial en cada turno hasta romper el límite de tokens/minuto del proveedor gratuito (413 "Request too large"), y dejaba la escritura real a merced de que el LLM no alucinara una tool a mitad de una conversación larga (pasó de verdad: "print_tree"). El diseño actual: `run_exploration_loop()` (`agents/mcp_tools.py`) corre un ciclo CORTO bindeado solo con tools de lectura → una única llamada `invoke_structured()` pide un `DeveloperPlan` compacto (lista de `FileChange`) → `apply_file_changes()` ejecuta ese plan iterando en Python, sin ningún LLM adicional. `MAX_TOOL_ITERATIONS` pasó a llamarse `MAX_EXPLORATION_TURNS` (12 → 5) y ahora limita solo la fase de exploración; ya no existe una llamada final a "ImplementationSummary" (resumen/notas vienen del propio plan). El resto de las decisiones de esta sección (RAG, conexión MCP por protocolo, cálculo determinista de resultados) siguen aplicando igual.
+
 La propuesta del Architect Agent (`architecture`) llega ahora a la mesa del **ingeniero que construye de verdad**. A diferencia de los tres agentes anteriores, este no solo lee y redacta un documento estructurado: **actúa** sobre el repositorio real del sistema MVC (`REPO_TARGET_PATH`), explorando su estructura y creando/editando archivos a través de las tools MCP (`mcp_server/server.py`, Fase 5). Es el único agente autorizado a tocar el filesystem, y siempre lo hace a través de esas tools sandboxeadas — nunca abre un archivo directamente.
 
 Es el **agente 4 de 6** en el orden de construcción de la Fase 6. Introduce dos cosas nuevas: (1) el retriever de desarrollo (`get_development_retriever`, dominio `knowledge/development/`) y (2) el primer uso real del **MCP** — un servidor externo con el que este agente conversa por protocolo, no por import directo.
@@ -413,6 +415,8 @@ Con `testing_agent.py` (agente 5/6) apareció el segundo agente que necesita exa
 ---
 
 ## 5. Testing Agent (`agents/testing_agent.py`)
+
+> **Actualización:** mismo rediseño "planificar separado de ejecutar" que Developer Agent (ver la nota en su sección) — `run_exploration_loop()` corto (solo lectura) → un `TestingPlan` compacto (`casos_a_agregar` + `run_tests_calls`) vía `invoke_structured()` → el código ejecuta ese plan (casos nuevos con `apply_file_changes()`, luego cada `run_tests` del plan) sin LLM adicional. Si el plan no propone ninguna corrida de `run_tests` (a pesar de que el prompt lo exige), el código agrega una corrida por defecto sobre la raíz — la obligación de correr tests reales queda garantizada por código, no solo por el prompt. `casos_generados` en el resultado final ahora es directamente `archivos_creados` (el hecho verificable), no una lista redactada por el LLM.
 
 Lo que implementó el Developer Agent (`implementation`) llega ahora a la mesa del **QA engineer del estudio**. Es el primer agente que no solo lee/escribe información — **verifica objetivamente** si algo funciona, corriendo pruebas reales sobre el repositorio real, no describiendo lo que "debería" pasar.
 
