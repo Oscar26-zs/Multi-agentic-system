@@ -51,6 +51,10 @@ class EngineeringState(TypedDict):
     # --- Human-in-the-Loop: aprobación del plan antes de tocar el repo real ---
     plan_approval: dict       # request_plan_approval (graph/edges.py): {"approved": bool, "note": str}
 
+    # --- Modo propuesta: los agentes Developer/Testing generan una propuesta de
+    # cambios (diffs + casos de test) sin escribir/ejecutar nada en el repo real ---
+    proposal_mode: bool       # True => Developer/Testing proponen en vez de aplicar/ejecutar
+
     # --- Control del ciclo de revisión ---
     iteration: int            # contador de vueltas del ciclo; lo compara MAX_ITERATIONS en workflow.py
 
@@ -62,11 +66,14 @@ class EngineeringState(TypedDict):
     human_review_required: bool
 
 
-def create_initial_state(requirement: str) -> EngineeringState:
+def create_initial_state(requirement: str, proposal_mode: bool = False) -> EngineeringState:
     """Construye el estado inicial consistente para cualquier entrypoint.
 
     Usada por app.py y por tests/test_graph.py / test_scenarios.py
     para no repetir defaults ni cometer typos en las llaves.
+
+    proposal_mode=True pone el pipeline en modo "solo propuesta": los agentes
+    Developer y Testing generan diffs/casos de test sin tocar el repo real.
     """
     return {
         "requirement": requirement,
@@ -77,6 +84,7 @@ def create_initial_state(requirement: str) -> EngineeringState:
         "test_results": {},
         "review": {},
         "plan_approval": {},
+        "proposal_mode": proposal_mode,
         "iteration": 0,
         "messages": [],
         "errors": [],

@@ -81,6 +81,7 @@ __all__ = [
     "run_exploration_loop",
     "summarize_exploration",
     "apply_file_changes",
+    "plan_to_changes",
 ]
 
 
@@ -325,5 +326,31 @@ async def apply_file_changes(
         else:
             archivos_modificados.append(cambio.file_path)
             diffs[cambio.file_path] = unified_diff(cambio.old_text, cambio.new_text, cambio.file_path)
+
+    return archivos_creados, archivos_modificados, diffs, pasos
+
+
+def plan_to_changes(cambios: list[FileChange]) -> tuple[list[str], list[str], dict, list[str]]:
+    """Calcula (archivos_creados, archivos_modificados, diffs, pasos) a partir de
+    una lista de FileChange SIN tocar el servidor MCP — puro Python.
+
+    Lo usa el modo propuesta (Developer/Testing) para derivar los diffs que se
+    van a volcar en el archivo de propuesta, en lugar de aplicarlos de verdad
+    contra el repo con apply_file_changes(). Mismo shape de salida que
+    apply_file_changes() para que el resto de cada agente no cambie.
+    """
+    archivos_creados: list[str] = []
+    archivos_modificados: list[str] = []
+    diffs: dict = {}
+    pasos: list[str] = []
+
+    for cambio in cambios:
+        if cambio.accion == "crear":
+            archivos_creados.append(cambio.file_path)
+            diffs[cambio.file_path] = unified_diff("", cambio.contenido, cambio.file_path)
+        else:
+            archivos_modificados.append(cambio.file_path)
+            diffs[cambio.file_path] = unified_diff(cambio.old_text, cambio.new_text, cambio.file_path)
+        pasos.append(f"{cambio.accion}({cambio.file_path}) -> propuesto: {cambio.razon}")
 
     return archivos_creados, archivos_modificados, diffs, pasos

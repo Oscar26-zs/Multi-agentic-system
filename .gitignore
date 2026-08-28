@@ -1,15 +1,2 @@
-# Entorno
-.venv/
-.venv-1/
-
-# Secretos
-.env
-
-# Artefactos generados (vector store, caches)
-chroma_db/
-__pycache__/
-*.pyc
-.pytest_cache/
-
-# Clon local del repo MVC usado por el MCP
-_sandbox/
+# Created by venv; see https://docs.python.org/3/library/venv.html
+*

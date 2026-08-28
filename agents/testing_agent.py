@@ -84,6 +84,7 @@ from agents.mcp_tools import (
     FileChange,
     apply_file_changes,
     mcp_server_params,
+    plan_to_changes,
     result_text,
     run_exploration_loop,
     summarize_exploration,
@@ -217,10 +218,17 @@ def _aggregate_run_tests(run_tests_calls: list[dict]) -> dict:
 
 async def _plan_and_apply(
     mensaje_usuario: str,
-) -> tuple[list[str], list[str], list[dict], list[str], str, list[str], list[str]]:
+    proposal_mode: bool = False,
+) -> tuple[list[str], list[str], list[dict], list[str], str, list[str], list[str], "TestingPlan"]:
     """Explora corto, pide un plan estructurado y lo ejecuta sin LLM adicional.
 
-    Devuelve (archivos_creados, archivos_modificados, run_tests_calls, pasos, resumen, hallazgos, notas).
+    En proposal_mode, en vez de crear archivos de test y correr `dotnet test`
+    contra el repo real, deriva los diffs de los casos propuestos con
+    plan_to_changes() (puro Python) para que el pipeline arme un archivo de
+    propuesta sin tocar el repositorio.
+
+    Devuelve (archivos_creados, archivos_modificados, run_tests_calls, pasos,
+    resumen, hallazgos, notas, plan).
     """
     async with stdio_client(mcp_server_params()) as (read, write):
         async with ClientSession(read, write) as session:
@@ -259,8 +267,31 @@ async def _plan_and_apply(
             corridas = plan.run_tests_calls or [RunTestsCall(subpath="", filter="")]
             print(
                 f"      [Testing Agent] plan con {len(plan.casos_a_agregar)} caso(s) nuevo(s) y "
-                f"{len(corridas)} corrida(s) de run_tests; ejecutando..."
+                f"{len(corridas)} corrida(s) de run_tests; "
+                f"{'generando propuesta (sin ejecutar)' if proposal_mode else 'ejecutando'}..."
             )
+
+            if proposal_mode:
+                # Modo propuesta: NO se crean archivos de test ni se corre
+                # run_tests. Se derivan los diffs de los casos propuestos para
+                # volcarlos al archivo de propuesta (app.py lo escribe).
+                archivos_creados, archivos_modificados, _diffs, pasos = plan_to_changes(
+                    plan.casos_a_agregar
+                )
+                for llamada in corridas:
+                    pasos.append(
+                        f"run_tests(subpath={llamada.subpath!r}) -> propuesto (no ejecutado)"
+                    )
+                return (
+                    archivos_creados,
+                    archivos_modificados,
+                    [],  # run_tests_calls: en modo propuesta no hay ejecución real
+                    pasos,
+                    plan.resumen,
+                    plan.hallazgos,
+                    plan.notas,
+                    plan,
+                )
 
             archivos_creados, archivos_modificados, _diffs, pasos = await apply_file_changes(
                 session, plan.casos_a_agregar, "Testing Agent"
@@ -291,6 +322,7 @@ async def _plan_and_apply(
                 plan.resumen,
                 plan.hallazgos,
                 plan.notas,
+                plan,
             )
 
 
@@ -336,30 +368,73 @@ def testing_agent(state: EngineeringState) -> dict:
         f"{contexto}"
     )
 
-    archivos_creados, archivos_modificados, run_tests_calls, pasos, resumen, hallazgos, notas = asyncio.run(
-        _plan_and_apply(mensaje_usuario)
+    es_propuesta = bool(state.get("proposal_mode", False))
+    archivos_creados, archivos_modificados, run_tests_calls, pasos, resumen, hallazgos, notas, plan = asyncio.run(
+        _plan_and_apply(mensaje_usuario, proposal_mode=es_propuesta)
     )
 
-    test_results = {
-        "resumen": resumen,
-        "casos_generados": archivos_creados,
-        "hallazgos": hallazgos,
-        "notas": notas,
-        **_aggregate_run_tests(run_tests_calls),
-        "archivos_creados": archivos_creados,
-        "archivos_modificados": archivos_modificados,
-        "pasos_seguidos": pasos,
-        "fuentes_consultadas": fuentes,
-    }
+    if es_propuesta:
+        # Modo propuesta: no hay ejecución real de tests. Se reporta la
+        # propuesta de casos en vez de pass/fail. El Reviewer no fuerza
+        # REJECTED por falta de tests reales en este modo (ver reviewer_agent).
+        _creados, _modificados, diffs_tests, _pasos = plan_to_changes(plan.casos_a_agregar)
+        casos_propuestos = [
+            {
+                "file_path": c.file_path,
+                "accion": c.accion,
+                "razon": c.razon,
+                "diff": diffs_tests.get(c.file_path, ""),
+            }
+            for c in plan.casos_a_agregar
+        ]
+        test_results = {
+            "resumen": resumen,
+            "propuesta": True,
+            "ejecutado": False,
+            "aprobado": None,
+            "casos_propuestos": casos_propuestos,
+            "diff": "\n\n".join(diffs_tests[p] for p in sorted(diffs_tests)) or "(sin casos de test propuestos)",
+            "casos_generados": archivos_creados,
+            "hallazgos": hallazgos,
+            "notas": notas,
+            "passed": 0,
+            "failed": 0,
+            "skipped": 0,
+            "total": 0,
+            "comandos_ejecutados": [],
+            "archivos_creados": archivos_creados,
+            "archivos_modificados": archivos_modificados,
+            "pasos_seguidos": pasos,
+            "fuentes_consultadas": fuentes,
+        }
+        mensaje = (
+            f"testing_agent: propuesta de casos de test generada (sin ejecutar) "
+            f"({len(archivos_creados)} archivo(s) de test a crear/modificar, "
+            f"fuentes RAG: {', '.join(fuentes) if fuentes else 'ninguna'})."
+        )
+    else:
+        agregados = _aggregate_run_tests(run_tests_calls)
+        test_results = {
+            "resumen": resumen,
+            "casos_generados": archivos_creados,
+            "hallazgos": hallazgos,
+            "notas": notas,
+            **agregados,
+            "archivos_creados": archivos_creados,
+            "archivos_modificados": archivos_modificados,
+            "pasos_seguidos": pasos,
+            "fuentes_consultadas": fuentes,
+        }
+        mensaje = (
+            f"testing_agent: {agregados['passed']} passed, {agregados['failed']} failed, "
+            f"{agregados['skipped']} skipped de {agregados['total']} total "
+            f"({len(run_tests_calls)} corrida(s) de run_tests), aprobado={agregados['aprobado']}, "
+            f"fuentes RAG: {', '.join(fuentes) if fuentes else 'ninguna'})."
+        )
 
     return {
         "test_results": test_results,
-        "messages": [
-            f"testing_agent: {test_results['passed']} passed, {test_results['failed']} failed, "
-            f"{test_results['skipped']} skipped de {test_results['total']} total "
-            f"({len(run_tests_calls)} corrida(s) de run_tests), aprobado={test_results['aprobado']}, "
-            f"fuentes RAG: {', '.join(fuentes) if fuentes else 'ninguna'})."
-        ],
+        "messages": [mensaje],
     }
 
 

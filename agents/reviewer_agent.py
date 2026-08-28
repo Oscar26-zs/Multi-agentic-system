@@ -146,17 +146,27 @@ def _truncate(value, limit: int = _DIFF_CHAR_LIMIT):
     return value
 
 
-def _coerce_verdict(verdict: ReviewVerdict, security_review: dict, test_results: dict) -> dict:
+def _coerce_verdict(
+    verdict: ReviewVerdict,
+    security_review: dict,
+    test_results: dict,
+    proposal_mode: bool = False,
+) -> dict:
     """Aplica los guardrails deterministas sobre el veredicto del LLM.
 
     Nunca deja pasar un APPROVED si security_review["aprobado"] o
     test_results["aprobado"] son explícitamente False — ver decisiones en el
     docstring del módulo.
+
+    En proposal_mode el guardrail de testing se omite: no hay ejecución real de
+    tests, así que test_results["aprobado"] es None y no debe forzar REJECTED.
+    El guardrail de seguridad sí aplica (revisa la arquitectura propuesta, no
+    requiere ejecutar nada).
     """
     data = verdict.model_dump()
 
     security_bloquea = security_review.get("aprobado") is False
-    testing_bloquea = test_results.get("aprobado") is False
+    testing_bloquea = (not proposal_mode) and test_results.get("aprobado") is False
 
     if security_bloquea or testing_bloquea:
         data["status"] = "REJECTED"
@@ -224,7 +234,7 @@ def reviewer_agent(state: EngineeringState) -> dict:
         ],
     )
 
-    review = _coerce_verdict(verdict, security_review, test_results)
+    review = _coerce_verdict(verdict, security_review, test_results, proposal_mode=bool(state.get("proposal_mode", False)))
 
     return {
         "review": review,

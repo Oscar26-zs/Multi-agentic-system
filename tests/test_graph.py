@@ -49,6 +49,7 @@ from graph.edges import (
     advance_iteration,
     cancelled_by_human,
     escalate_to_human,
+    request_plan_approval,
     route_after_plan_approval,
     route_after_review,
 )
@@ -111,6 +112,33 @@ def test_cancelled_by_human_deja_status_cancelled_y_escala():
     assert resultado["review"]["status"] == "CANCELLED"
     assert resultado["review"]["return_to"] is None
     assert resultado["human_review_required"] is True
+
+
+def test_request_plan_approval_modo_propuesta_pregunta_y_aprueba(monkeypatch, capsys):
+    """En proposal_mode el gate reusa el mismo nodo pero pregunta por generar la
+    propuesta (no por escribir el repo). Monkeypatcheamos input() para no
+    bloquear en stdin real."""
+    monkeypatch.setattr("builtins.input", lambda _prompt: "s")
+    estado = create_initial_state(REQUIREMENT, proposal_mode=True)
+    estado["architecture"] = {"resumen": "arch", "stack": ["x"], "componentes": ["c"],
+                              "plan_alto_nivel": ["p"], "riesgos_tecnicos": []}
+
+    resultado = request_plan_approval(estado)
+
+    assert resultado["plan_approval"]["approved"] is True
+    assert "propuesta" in resultado["plan_approval"]["note"].lower()
+    salida = capsys.readouterr().out
+    assert "generar la propuesta" in salida.lower() or "propuesta" in salida.lower()
+
+
+def test_request_plan_approval_modo_propuesta_rechazo_cancela(monkeypatch, capsys):
+    monkeypatch.setattr("builtins.input", lambda _prompt: "n")
+    estado = create_initial_state(REQUIREMENT, proposal_mode=True)
+    estado["architecture"] = {"resumen": "arch", "stack": ["x"], "componentes": ["c"],
+                              "plan_alto_nivel": ["p"], "riesgos_tecnicos": []}
+
+    resultado = request_plan_approval(estado)
+    assert resultado["plan_approval"]["approved"] is False
 
 
 # ---------- graph/workflow.py: ensamblaje completo con nodos fake (sin LLM) ----------

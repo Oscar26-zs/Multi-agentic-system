@@ -98,6 +98,14 @@ Nunca commitear `.env` (ya está en `.gitignore`).
 
 Corre el pipeline completo (llamadas reales a LLM/RAG/MCP — tarda varios minutos), imprimiendo progreso en vivo (qué agente terminó, en qué momento) en vez de esperar en silencio hasta el final. Apenas termina `architect_agent`, **pausa y pide aprobación por teclado** antes de dejar avanzar a `developer_agent` (ver `graph/HUMAN_IN_THE_LOOP.md`). Al final imprime el veredicto y el expediente de cada etapa. Código de salida: `0` = `APPROVED`, `1` = `REJECTED`, `2` = escalado a revisión humana (`MAX_ITERATIONS` agotado), `3` = cancelado por el usuario en el gate de aprobación.
 
+### Modo propuesta (`--propuesta`)
+
+Si se pasa `--propuesta`, los agentes **Developer y Testing no tocan el repositorio real**: exploran el repo en solo lectura para contextualizar, pero en vez de aplicar archivos (`create_file`/`update_file`) o correr `dotnet test`, generan una **propuesta de cambios** (diffs de código + casos de test propuestos). Al final se guarda un único archivo Markdown en `propuestas/propuesta_YYYYMMDD_HHMMSS.md` (dentro de este workspace, sin escribir nada en el repo objetivo) con el requerimiento, la arquitectura, los hallazgos de seguridad, los diffs propuestos y el veredicto del Reviewer. El gate Human-in-the-Loop se reusa con la pregunta *"¿Genero y guardo la propuesta de cambios?"*. En este modo el Reviewer no fuerza `REJECTED` por falta de tests reales (no se ejecutan), aunque sí mantiene el guardrail de seguridad.
+
+```powershell
+.venv\Scripts\python.exe app.py --propuesta "Como empleado quiero poder solicitar vacaciones..."
+```
+
 También se puede correr cada agente o cada módulo por separado, de forma aislada (mismo patrón en todos: `if __name__ == "__main__":`):
 
 ```powershell

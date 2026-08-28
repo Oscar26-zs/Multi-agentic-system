@@ -99,6 +99,7 @@ from agents.mcp_tools import (
     FileChange,
     apply_file_changes,
     mcp_server_params,
+    plan_to_changes,
     run_exploration_loop,
     summarize_exploration,
 )
@@ -206,8 +207,13 @@ def _format_diffs(diffs: dict) -> str:
 
 async def _plan_and_apply(
     mensaje_usuario: str,
+    proposal_mode: bool = False,
 ) -> tuple[list[str], list[str], dict, list[str], str, list[str]]:
     """Explora corto, pide un plan estructurado y lo ejecuta sin LLM adicional.
+
+    En proposal_mode, en vez de aplicar los cambios contra el repo real vía MCP,
+    deriva los diffs con plan_to_changes() (puro Python) para que el pipeline
+    arme un archivo de propuesta sin tocar el repositorio.
 
     Devuelve (archivos_creados, archivos_modificados, diffs, pasos, resumen, notas).
     """
@@ -246,7 +252,19 @@ async def _plan_and_apply(
                     "No se generó ninguna implementación: todos los proveedores LLM "
                     "fallaron al pedir el plan de cambios."
                 ), []
-            print(f"      [Developer Agent] plan con {len(plan.cambios)} cambio(s); ejecutando...")
+            print(
+                f"      [Developer Agent] plan con {len(plan.cambios)} cambio(s); "
+                f"{'generando propuesta (sin escribir el repo)' if proposal_mode else 'ejecutando'}..."
+            )
+
+            if proposal_mode:
+                # Modo propuesta: NO se aplica nada contra el repo real. Se
+                # derivan los diffs en Python para volcarlos al archivo de
+                # propuesta (app.py se encarga de escribirlo).
+                archivos_creados, archivos_modificados, diffs, pasos = plan_to_changes(plan.cambios)
+                if not plan.cambios:
+                    pasos.append("⚠ el plan no propuso ningún cambio de archivo.")
+                return archivos_creados, archivos_modificados, diffs, pasos, plan.resumen, plan.notas
 
             archivos_creados, archivos_modificados, diffs, pasos = await apply_file_changes(
                 session, plan.cambios, "Developer Agent"
@@ -295,7 +313,7 @@ def developer_agent(state: EngineeringState) -> dict:
     )
 
     archivos_creados, archivos_modificados, diffs, pasos, resumen, notas = asyncio.run(
-        _plan_and_apply(mensaje_usuario)
+        _plan_and_apply(mensaje_usuario, proposal_mode=bool(state.get("proposal_mode", False)))
     )
 
     implementation = {
@@ -308,13 +326,23 @@ def developer_agent(state: EngineeringState) -> dict:
         "fuentes_consultadas": fuentes,
     }
 
-    return {
-        "implementation": implementation,
-        "messages": [
+    es_propuesta = bool(state.get("proposal_mode", False))
+    if es_propuesta:
+        mensaje = (
+            f"developer_agent: propuesta de cambios generada (sin escribir el repo) "
+            f"({len(archivos_creados)} archivo(s) a crear, {len(archivos_modificados)} a modificar, "
+            f"fuentes RAG: {', '.join(fuentes) if fuentes else 'ninguna'})."
+        )
+    else:
+        mensaje = (
             f"developer_agent: implementación completada ({len(archivos_creados)} archivo(s) creado(s), "
             f"{len(archivos_modificados)} modificado(s), {len(pasos)} acción(es) MCP, "
             f"fuentes RAG: {', '.join(fuentes) if fuentes else 'ninguna'})."
-        ],
+        )
+
+    return {
+        "implementation": implementation,
+        "messages": [mensaje],
     }
 
 

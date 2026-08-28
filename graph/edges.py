@@ -30,9 +30,11 @@ Decisiones (Fase 7 de Guia_Construccion.md, paso 3/3):
       escalate_to_human en vez de terminar en silencio: ese nodo deja
       human_review_required=True, el campo que graph/state.py ya reserva
       exactamente para este caso.
-    - MAX_ITERATIONS = 3 (fijado por Guia_Construccion.md, no configurable
+    - MAX_ITERATIONS = 2 (fijado por Guia_Construccion.md, no configurable
       por env var en esta fase: es una decisión de diseño del pipeline, no un
-      parámetro de despliegue).
+      parámetro de despliegue). El contador suma una vuelta por cada REJECTED
+      del Reviewer; con 2 se permiten a lo sumo dos pasadas completas del
+      pipeline y luego se escala a humano en vez de buclear.
     - request_plan_approval / route_after_plan_approval / cancelled_by_human:
       segundo punto de Human-in-the-Loop (el primero es escalate_to_human de
       arriba), agregado a pedido explícito de la consigna del proyecto
@@ -75,7 +77,7 @@ __all__ = [
     "cancelled_by_human",
 ]
 
-MAX_ITERATIONS = 3
+MAX_ITERATIONS = 1
 
 _LOOP_TARGETS = {
     "product_agent",
@@ -143,12 +145,21 @@ def request_plan_approval(state: EngineeringState) -> dict:
     teclado (input() bloqueante) la aprobación humana ANTES de dejar avanzar
     a developer_agent, que es quien de verdad escribe sobre el repo real.
 
+    En proposal_mode la pregunta cambia: no se va a escribir el repo, así que
+    se consulta si el humano autoriza a generar/guardar la propuesta de
+    cambios en `propuestas/`. La pausa se mantiene (el humano decide si
+    arranca la generación de la propuesta), pero el significado es distinto.
+
     Se ejecuta siempre después de architect_agent (ver graph/workflow.py).
     """
     architecture = state.get("architecture", {})
+    es_propuesta = bool(state.get("proposal_mode", False))
 
     print("\n" + "=" * 70)
-    print("HUMAN-IN-THE-LOOP: aprobación requerida antes de tocar el repo real")
+    if es_propuesta:
+        print("HUMAN-IN-THE-LOOP: confirmación para generar la propuesta de cambios")
+    else:
+        print("HUMAN-IN-THE-LOOP: aprobación requerida antes de tocar el repo real")
     print("=" * 70)
     print(f"Resumen: {architecture.get('resumen', '(sin resumen)')}")
     print("Stack: " + (", ".join(architecture.get("stack", [])) or "(vacío)"))
@@ -163,9 +174,18 @@ def request_plan_approval(state: EngineeringState) -> dict:
         for riesgo in architecture["riesgos_tecnicos"]:
             print(f"  - {riesgo}")
 
-    respuesta = input(
-        "\n¿Autorizas a Developer Agent a ejecutar este plan sobre el repo real? [s/N]: "
-    ).strip().lower()
+    if es_propuesta:
+        pregunta = (
+            "\n¿Genero y guardo la propuesta de cambios (sin tocar el repo real)? [s/N]: "
+        )
+        nota = "Confirmación manual vía CLI para generar la propuesta (modo propuesta)."
+    else:
+        pregunta = (
+            "\n¿Autorizas a Developer Agent a ejecutar este plan sobre el repo real? [s/N]: "
+        )
+        nota = "Aprobación manual vía CLI (request_plan_approval)."
+
+    respuesta = input(pregunta).strip().lower()
     aprobado = respuesta in ("s", "si", "sí", "y", "yes")
 
     print(f"{'APROBADO' if aprobado else 'RECHAZADO'} por el usuario.\n")
@@ -173,10 +193,11 @@ def request_plan_approval(state: EngineeringState) -> dict:
     return {
         "plan_approval": {
             "approved": aprobado,
-            "note": "Aprobación manual vía CLI (request_plan_approval).",
+            "note": nota,
         },
         "messages": [
-            f"request_plan_approval: plan {'aprobado' if aprobado else 'rechazado'} por el usuario."
+            f"request_plan_approval: {'propuesta' if es_propuesta else 'plan'} "
+            f"{'aprobado' if aprobado else 'rechazado'} por el usuario."
         ],
     }
 

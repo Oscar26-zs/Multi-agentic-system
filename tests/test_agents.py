@@ -50,6 +50,7 @@ from agents.mcp_tools import (
     FileChange,
     apply_file_changes,
     invoke_with_retry,
+    plan_to_changes,
     result_text,
     summarize_args,
     track_file_change,
@@ -60,7 +61,9 @@ from agents.reviewer_agent import ReviewVerdict, _coerce_verdict, reviewer_agent
 from agents.security_agent import SecurityFinding, SecurityReview, security_agent
 from agents.testing_agent import _aggregate_run_tests
 from agents.testing_agent import testing_agent as run_testing_agent
+from agents.llm_factory import _es_error_function_calling_invalido, invoke_structured
 from graph.state import create_initial_state
+from langchain_core.messages import HumanMessage
 
 REQUIREMENT = (
     "Como empleado quiero poder solicitar vacaciones indicando fecha de inicio "
@@ -470,3 +473,279 @@ def test_coerce_verdict_return_to_invalido_cae_a_developer_agent():
     review = _coerce_verdict(verdict_del_llm, {"aprobado": True}, {"aprobado": True})
     assert review["status"] == "REJECTED"
     assert review["return_to"] == "developer_agent"
+
+
+# ---------- modo propuesta ----------
+
+
+def test_plan_to_changes_deriva_diff_sin_mcp():
+    """plan_to_changes debe calcular creados/modificados/diffs como
+    apply_file_changes, pero sin tocar el servidor MCP (puro Python)."""
+    cambios = [
+        FileChange(file_path="a.cs", accion="crear", contenido="hola", razon="nuevo"),
+        FileChange(file_path="b.cs", accion="editar", old_text="x", new_text="y", razon="fix"),
+    ]
+    creados, modificados, diffs, pasos = plan_to_changes(cambios)
+    assert creados == ["a.cs"]
+    assert modificados == ["b.cs"]
+    assert set(diffs) == {"a.cs", "b.cs"}
+    assert len(pasos) == 2
+
+
+def test_coerce_verdict_modo_propuesta_no_bloquea_por_testing():
+    """En proposal_mode el guardrail de testing NO debe forzar REJECTED aunque
+    test_results['aprobado'] sea False (no hubo ejecución real de tests)."""
+    verdict_del_llm = ReviewVerdict(
+        status="APPROVED", resumen="Propuesta OK.", motivos=["Cumple."],
+        feedback="Verificado.", return_to=None,
+    )
+    review = _coerce_verdict(
+        verdict_del_llm, {"aprobado": True}, {"aprobado": False}, proposal_mode=True
+    )
+    assert review["status"] == "APPROVED"
+
+
+def test_coerce_verdict_modo_propuesta_si_bloquea_por_seguridad():
+    """Pero el guardrail de seguridad sí aplica en proposal_mode (revisa la
+    arquitectura, no requiere ejecutar nada)."""
+    verdict_del_llm = ReviewVerdict(
+        status="APPROVED", resumen="El LLM se equivoca.", motivos=["Todo bien."],
+        feedback="Aprobado.", return_to=None,
+    )
+    review = _coerce_verdict(
+        verdict_del_llm, {"aprobado": False}, {"aprobado": None}, proposal_mode=True
+    )
+    assert review["status"] == "REJECTED"
+    assert review["return_to"] == "architect_agent"
+
+
+def test_create_initial_state_proposal_mode():
+    state = create_initial_state(REQUIREMENT, proposal_mode=True)
+    assert state["proposal_mode"] is True
+    assert create_initial_state(REQUIREMENT)["proposal_mode"] is False
+
+
+# ---------- agents/llm_factory.py: fallback de salida estructurada ----------
+
+
+def test_es_error_function_calling_invalido_detecta_400_de_tool_fantasma():
+    class _Err(Exception):
+        status_code = 400
+        message = "tool call validation failed: attempted to call tool 'search_code' which was not in request.tools"
+
+    assert _es_error_function_calling_invalido(_Err()) is True
+
+
+def test_es_error_function_calling_invalido_detecta_400_degraded():
+    class _Err(Exception):
+        status_code = 400
+        message = "Function id 'search_code': DEGRADED function cannot be invoked"
+
+    assert _es_error_function_calling_invalido(_Err()) is True
+
+
+def test_es_error_function_calling_invalido_ignora_otros_errores():
+    class _BadRequest(Exception):
+        status_code = 400
+        message = "bad request"
+
+    class _ServerError(Exception):
+        status_code = 500
+        message = "tool call validation failed (pero es 5xx)"
+
+    assert _es_error_function_calling_invalido(_BadRequest()) is False
+    assert _es_error_function_calling_invalido(_ServerError()) is False
+
+
+def test_invoke_structured_cambia_a_json_schema_si_hay_tool_call_fantasma(monkeypatch):
+    """Si el modelo (ej. gpt-oss-120b) emite una tool call fantasma bajo
+    function_calling, invoke_structured debe reintentar el MISMO proveedor con
+    method='json_schema' y no abandonarlo."""
+    import agents.llm_factory as llm_mod
+    from pydantic import BaseModel, Field
+
+    class _FakeSchema(BaseModel):
+        resumen: str = Field(...)
+
+    fake_provider = {
+        "nombre": "FakeP",
+        "api_key_env": "FAKE_LLM_API_KEY",
+        "base_url": "http://fake",
+        "model": "fake-model",
+    }
+    monkeypatch.setattr(llm_mod, "_PROVEEDORES", [fake_provider])
+    monkeypatch.setenv("FAKE_LLM_API_KEY", "fake-key")
+
+    class _ToolCallError(Exception):
+        status_code = 400
+        message = "tool call validation failed: attempted to call tool 'search_code' which was not in request.tools"
+
+    class _FakeWithStructured:
+        def __init__(self, method):
+            self.method = method
+
+        def invoke(self, messages):
+            if self.method == "function_calling":
+                raise _ToolCallError()
+            return _FakeSchema(resumen="ok-json_schema")
+
+    class _FakeLLM:
+        def with_structured_output(self, schema, method="function_calling"):
+            return _FakeWithStructured(method)
+
+    monkeypatch.setattr(llm_mod, "ChatOpenAI", lambda **kw: _FakeLLM())
+
+    resultado = invoke_structured(_FakeSchema, [HumanMessage(content="x")])
+    assert resultado.resumen == "ok-json_schema"
+
+
+def test_invoke_structured_degraded_cae_a_json_schema(monkeypatch):
+    """Si Groq devuelve 400 'DEGRADED function cannot be invoked' bajo
+    function_calling, invoke_structured debe reintentar el MISMO proveedor con
+    method='json_schema' (que no registra la función) y no abandonarlo."""
+    import agents.llm_factory as llm_mod
+    from pydantic import BaseModel, Field
+
+    class _FakeSchema(BaseModel):
+        resumen: str = Field(...)
+
+    fake_provider = {
+        "nombre": "FakeP",
+        "api_key_env": "FAKE_LLM_API_KEY",
+        "base_url": "http://fake",
+        "model": "fake-model",
+    }
+    monkeypatch.setattr(llm_mod, "_PROVEEDORES", [fake_provider])
+    monkeypatch.setenv("FAKE_LLM_API_KEY", "fake-key")
+
+    class _DegradedError(Exception):
+        status_code = 400
+        message = "Function id 'search_code': DEGRADED function cannot be invoked"
+
+    class _FakeWithStructured:
+        def __init__(self, method):
+            self.method = method
+
+        def invoke(self, messages):
+            if self.method == "function_calling":
+                raise _DegradedError()
+            return _FakeSchema(resumen="ok-degraded-json_schema")
+
+    class _FakeLLM:
+        def with_structured_output(self, schema, method="function_calling"):
+            return _FakeWithStructured(method)
+
+    monkeypatch.setattr(llm_mod, "ChatOpenAI", lambda **kw: _FakeLLM())
+
+    resultado = invoke_structured(_FakeSchema, [HumanMessage(content="x")])
+    assert resultado.resumen == "ok-degraded-json_schema"
+
+
+def test_invoke_structured_reintenta_429_y_no_abandona_proveedor(monkeypatch):
+    """Si el proveedor responde 429 (rate limit) en el primer intento,
+    invoke_structured debe reintentarlo (mismo proveedor) antes de rendirse."""
+    import agents.llm_factory as llm_mod
+    from pydantic import BaseModel, Field
+
+    class _FakeSchema(BaseModel):
+        resumen: str = Field(...)
+
+    fake_provider = {
+        "nombre": "FakeP",
+        "api_key_env": "FAKE_LLM_API_KEY",
+        "base_url": "http://fake",
+        "model": "fake-model",
+    }
+    monkeypatch.setattr(llm_mod, "_PROVEEDORES", [fake_provider])
+    monkeypatch.setenv("FAKE_LLM_API_KEY", "fake-key")
+
+    calls = {"n": 0}
+
+    class _RateLimitError(Exception):
+        status_code = 429
+        message = "Rate limit reached for model `x` ... try again in 2.91s."
+
+    class _FakeWithStructured:
+        def __init__(self, method):
+            self.method = method
+
+        def invoke(self, messages):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise _RateLimitError()
+            return _FakeSchema(resumen="ok-tras-429")
+
+    class _FakeLLM:
+        def with_structured_output(self, schema, method="function_calling"):
+            return _FakeWithStructured(method)
+
+    monkeypatch.setattr(llm_mod, "ChatOpenAI", lambda **kw: _FakeLLM())
+
+    resultado = invoke_structured(_FakeSchema, [HumanMessage(content="x")])
+    assert resultado.resumen == "ok-tras-429"
+    assert calls["n"] == 2
+
+
+def test_es_reintentable_considera_429():
+    from agents.llm_factory import _es_reintentable
+
+    class _RateLimit(Exception):
+        status_code = 429
+        message = "rate limit"
+
+    class _BadRequest(Exception):
+        status_code = 400
+        message = "bad"
+
+    assert _es_reintentable(_RateLimit()) is True
+    assert _es_reintentable(_BadRequest()) is False
+
+
+def test_escribir_propuesta_md_marca_correcciones_si_reviewer_rechaza(tmp_path):
+    """Si el Reviewer rechazó, la propuesta debe llevar el banner de rechazo y
+    la sección de 'Correcciones requeridas' apuntando al agente devuelto."""
+    import app as app_mod
+
+    resultado = {
+        "requirement": "Crear un hola mundo en C#",
+        "architecture": {"resumen": "API ASP.NET", "stack": ["ASP.NET"], "componentes": ["C"], "plan_alto_nivel": ["x"]},
+        "security_review": {},
+        "implementation": {"resumen": "impl", "diff": "++ hola"},
+        "test_results": {"resumen": "tests", "propuesta": True, "diff": "-- x"},
+        "review": {
+            "status": "REJECTED",
+            "resumen": "Falta validación",
+            "motivos": ["El endpoint no valida el body"],
+            "feedback": "Agregar validación en el controlador.",
+            "return_to": "developer_agent",
+        },
+    }
+    ruta = tmp_path / "propuesta.md"
+    app_mod._escribir_propuesta_md(resultado, ruta)
+
+    texto = ruta.read_text(encoding="utf-8")
+    assert "RECHAZADA" in texto
+    assert "Correcciones requeridas" in texto
+    assert "Implementación (Developer Agent)" in texto
+    assert "Agregar validación en el controlador." in texto
+    # No debe colapsar el diff de código ni de tests
+    assert "++ hola" in texto
+    assert "-- x" in texto
+
+
+def test_escribir_propuesta_md_sin_banner_si_approved(tmp_path):
+    import app as app_mod
+
+    resultado = {
+        "requirement": "Crear un hola mundo en C#",
+        "architecture": {"resumen": "API", "stack": ["ASP.NET"], "componentes": [], "plan_alto_nivel": []},
+        "security_review": {},
+        "implementation": {"resumen": "impl", "diff": "++ hola"},
+        "test_results": {"resumen": "tests", "propuesta": True, "diff": "-- x"},
+        "review": {"status": "APPROVED", "resumen": "ok", "motivos": [], "feedback": ""},
+    }
+    ruta = tmp_path / "propuesta.md"
+    app_mod._escribir_propuesta_md(resultado, ruta)
+    texto = ruta.read_text(encoding="utf-8")
+    assert "RECHAZADA" not in texto
+    assert "Correcciones requeridas" not in texto

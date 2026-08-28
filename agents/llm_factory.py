@@ -76,6 +76,7 @@ Decisiones:
 """
 
 import os
+import re
 import time
 
 from langchain_core.messages import HumanMessage
@@ -83,7 +84,7 @@ from langchain_openai import ChatOpenAI
 
 __all__ = ["build_llm", "invoke_structured"]
 
-_MAX_INTENTOS_POR_PROVEEDOR = 2  # intento original + 1 reintento
+_MAX_INTENTOS_POR_PROVEEDOR = 3  # intento original + 2 reintentos (soporta ventanas de ~3s de rate limit)
 _RETRY_DELAY_SECONDS = 2.0
 _REQUEST_TIMEOUT_SECONDS = 600.0  # cota dura por intento (10 min): evita cuelgues indefinidos de socket
 
@@ -118,16 +119,56 @@ _PROVEEDORES = [
 
 
 def _es_reintentable(error: Exception) -> bool:
-    """True si vale la pena reintentar el MISMO proveedor: 5xx/timeout/red.
+    """True si vale la pena reintentar el MISMO proveedor: 5xx/timeout/red/429.
 
-    False para errores 4xx (401 key inválida, 404 modelo no existe, 400
-    request mal formada) — esos no se arreglan reintentando, hay que pasar
-    al siguiente proveedor de inmediato.
+    False para errores 4xx distintos de 429 (401 key inválida, 404 modelo no
+    existe, 400 request mal formada) — esos no se arreglan reintentando, hay
+    que pasar al siguiente proveedor de inmediato. El 429 (rate limit) SÍ se
+    reintenta: es una ventana de cuota transitoria y el proveedor suele indicar
+    cuánto esperar en el propio mensaje (ver _espera_para).
     """
     status_code = getattr(error, "status_code", None)
     if status_code is None:
         return True  # error de red/timeout sin respuesta HTTP: vale la pena reintentar
-    return status_code >= 500
+    return status_code >= 500 or status_code == 429
+
+
+def _espera_para(error: Exception) -> float:
+    """Segundos a esperar antes de reintentar este error.
+
+    Si el mensaje del proveedor sugiere un tiempo (ej. Groq: "try again in
+    2.91s"), lo respeta con un margen pequeño; si no, usa _RETRY_DELAY_SECONDS.
+    """
+    msg = getattr(error, "message", "") or str(error)
+    m = re.search(r"try again in ([\d.]+)s", msg, re.IGNORECASE)
+    if m:
+        return max(_RETRY_DELAY_SECONDS, float(m.group(1)) + 0.1)
+    return _RETRY_DELAY_SECONDS
+
+
+def _es_error_function_calling_invalido(error: Exception) -> bool:
+    """True si el proveedor rechazó la salida estructurada con un 400 del tipo
+    "tool call validation failed: attempted to call tool X which was not in
+    request.tools" o "DEGRADED function cannot be invoked" (ambos vistos en
+    Groq con openai/gpt-oss-120b bajo method="function_calling").
+
+    En el primer caso el modelo emite una tool call "fantasma" a una tool que
+    NO está en la petición; en el segundo, Groq marca la función como degradada
+    y la rechaza. Como son 4xx, _es_reintentable() los daría por no
+    reintentables y abandonaría el proveedor; pero ambos casos CONVIENEN
+    reintentarse con method="json_schema", que no usa function-calling y evita
+    la tool call fantasma (y no registra la función, así que no hay función
+    degradada que invocar). Por eso tienen su propia detección.
+    """
+    status_code = getattr(error, "status_code", None)
+    if status_code != 400:
+        return False
+    msg = (getattr(error, "message", "") or str(error)).lower()
+    return (
+        "tool call validation failed" in msg
+        or "not in request.tools" in msg
+        or "degraded function cannot be invoked" in msg
+    )
 
 
 def _probar_proveedor(proveedor: dict, temperature: float) -> ChatOpenAI | None:
@@ -158,7 +199,7 @@ def _probar_proveedor(proveedor: dict, temperature: float) -> ChatOpenAI | None:
                     f"   REINTENTANDO - {proveedor['nombre']} (intento {intento + 1}/"
                     f"{_MAX_INTENTOS_POR_PROVEEDOR}, error reintentable: {error})..."
                 )
-                time.sleep(_RETRY_DELAY_SECONDS)
+                time.sleep(_espera_para(error))
                 continue
             print(
                 f"   ALERTA - {proveedor['nombre']} no respondió ({error}); "
@@ -222,21 +263,34 @@ def invoke_structured(schema, messages: list, method: str = "function_calling", 
             timeout=_REQUEST_TIMEOUT_SECONDS,
         )
 
+        # method puede cambiar a "json_schema" si el modelo lanza una tool call
+        # fantasma bajo function_calling (ver _es_error_tool_call_invalido).
+        metodo_actual = method
         resultado = None
         error_final: Exception | None = None
         for intento in range(1, _MAX_INTENTOS_POR_PROVEEDOR + 1):
             try:
-                resultado = llm.with_structured_output(schema, method=method).invoke(messages)
+                resultado = llm.with_structured_output(schema, method=metodo_actual).invoke(messages)
                 error_final = None
                 break
             except Exception as error:
                 error_final = error
+                if _es_error_function_calling_invalido(error) and metodo_actual != "json_schema":
+                    # Mismo proveedor, pero sin function-calling: reintenta en
+                    # el acto (sin espera) con json_schema, que no deja lugar a
+                    # tool calls fantasma. No cuenta como fallo definitivo.
+                    print(
+                        f"   REINTENTANDO - {proveedor['nombre']} con method='json_schema' "
+                        f"(tool call inválido del modelo: {error})..."
+                    )
+                    metodo_actual = "json_schema"
+                    continue
                 if intento < _MAX_INTENTOS_POR_PROVEEDOR and _es_reintentable(error):
                     print(
                         f"   REINTENTANDO - {proveedor['nombre']} (intento {intento + 1}/"
                         f"{_MAX_INTENTOS_POR_PROVEEDOR}, error reintentable: {error})..."
                     )
-                    time.sleep(_RETRY_DELAY_SECONDS)
+                    time.sleep(_espera_para(error))
                     continue
                 break
 
@@ -257,7 +311,11 @@ def invoke_structured(schema, messages: list, method: str = "function_calling", 
             errores.append(f"{proveedor['nombre']}: devolvió None")
             continue
 
-        print(f"   OK - usando {proveedor['nombre']} (modelo: {proveedor['model']}) para salida estructurada.")
+        metodo_usado = f" (method='{metodo_actual}')" if metodo_actual != method else ""
+        print(
+            f"   OK - usando {proveedor['nombre']} (modelo: {proveedor['model']}){metodo_usado} "
+            f"para salida estructurada."
+        )
         return resultado
 
     detalle = "; ".join(errores) if errores else "ninguna API key configurada"
